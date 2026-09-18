@@ -1,0 +1,20 @@
+# ── Web framework / ASGI server ──────────────────────────────
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# ── Data / numerics ──────────────────────────────────────────
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+
+# ── Forecasting (imported optionally in service.py; installed for full functionality) ──
+statsmodels>=0.14
+scipy>=1.11
+
+# ── HTTP client + config ─────────────────────────────────────
+requests>=2.31
+python-dotenv>=1.0
+
+# ── Testing ──────────────────────────────────────────────────
+pytest>=8.0
+httpx>=0.27

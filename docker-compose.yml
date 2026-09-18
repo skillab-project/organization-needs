@@ -1,0 +1,15 @@
+services:
+  organization-needs:
+    image: ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:${DOCKER_TAG}
+    build: .
+    container_name: organization-needs
+    env_file:
+      - .env
+    environment:
+      - TRACKER_API=https://skillab-tracker.csd.auth.gr/api
+      - LLM_API_URL=http://160.40.52.27:3000/api
+    ports:
+      - "8871:8000"
+    labels:
+      io.portainer.accesscontrol.teams: skillab-all
+    restart: unless-stopped

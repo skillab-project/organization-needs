@@ -1,0 +1,136 @@
+pipeline {
+    agent {
+        node {
+            label 'dev-server'
+        }
+    }
+    environment {
+        APP_NAME = "organization-needs"
+        MAJOR_RELEASE = 0.1
+        DOCKER_TAG = "${MAJOR_RELEASE}.${env.BUILD_NUMBER}"
+        DOCKER_REG = "harbor.skillab-project.eu"
+        DOCKER_REPO = "/skillab-all/"
+        DOCKER_REG_CREDS = "harbor-creds"
+        DOCKER_HUB_REG = "docker.io"
+        DOCKER_HUB_CREDS = "docker-hub-creds"
+        DOCKER_HUB_USERNAME = "skillabproject"
+    }
+
+    stages {
+        // *************************
+        // *** PREPARATION STAGE ***
+        // *************************
+        stage('Preparation') {
+            steps {
+                echo "***** Cleaning Workspace and Checking Out Code *****"
+                cleanWs()
+                checkout scm
+            }
+        }
+
+        // *************************
+        // *** IMAGE BUILD STAGE ***
+        // *************************
+        stage("Build_Docker_Images"){
+            steps {
+                echo "***** Building Docker Image *****"
+                withCredentials([
+                    usernamePassword(credentialsId: 'tracker-api-creds', usernameVariable: 'TRACKER_USER', passwordVariable: 'TRACKER_PASS'),
+                    string(credentialsId: 'llm-api-creds', variable: 'LLM_API_PASS')
+                ]) {
+                    sh """
+                        echo "TRACKER_USERNAME=${TRACKER_USER}" >> .env
+                        echo "TRACKER_PASSWORD=${TRACKER_PASS}" >> .env
+                        echo "LLM_API_TOKEN=${LLM_API_PASS}" >> .env
+                        docker compose build
+                    """
+                }
+            }
+        }
+
+        // // ******************
+        // // *** UNIT TESTS ***
+        // // ******************
+        // stage("Run Unit Tests") {
+        //     steps {
+        //         echo "***** Run Unit Tests in Docker *****"
+        //         sh "docker compose run --rm organization-needs python -m pytest tests/unit/"
+        //     }
+        // }
+
+        // // ********************************
+        // // *** INTEGRATION TESTS ***
+        // // ********************************
+        // stage("Run Integration Tests") {
+        //     steps {
+        //         echo "***** Run Integration Tests *****"
+        //         sh "docker compose run --rm organization-needs python -m pytest tests/integration/"
+        //     }
+        // }
+
+        // ****************************
+        // *** Push Images In Harbor ***
+        // ****************************
+        stage("Push_Image"){
+            when {
+                environment name: "GIT_BRANCH", value: "origin/main"
+            }
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${DOCKER_REG_CREDS}", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]){
+                    echo "***** Push Docker Image *****"
+                    sh '''
+                        docker login ${DOCKER_REG} -u ${USERNAME} -p ${PASSWORD}
+                        docker tag ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:${DOCKER_TAG} ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:latest
+                        docker image push ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:${DOCKER_TAG}
+                        docker image push ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:latest
+                    '''
+                }
+            }
+        }
+        
+        // ********************************
+        // *** Push Images In Docker Hub ***
+        // ********************************
+        stage("Push_Image_Docker_Hub"){
+            when {
+                environment name: "GIT_BRANCH", value: "origin/main"
+            }
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${DOCKER_HUB_CREDS}", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]){
+                    echo "***** Push Docker Image to Docker Hub *****"
+                    sh 'docker login ${DOCKER_HUB_REG} -u ${USERNAME} -p ${PASSWORD}'
+                    sh 'docker image tag ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:${DOCKER_TAG} ${USERNAME}/${APP_NAME}:${DOCKER_TAG}'
+                    sh 'docker image tag ${DOCKER_REG}${DOCKER_REPO}${APP_NAME}:${DOCKER_TAG} ${USERNAME}/${APP_NAME}:latest'
+                    sh 'docker image push ${USERNAME}/${APP_NAME}:${DOCKER_TAG}'
+                    sh 'docker image push ${USERNAME}/${APP_NAME}:latest'
+                }
+            }
+        }
+        
+        // **************
+        // *** Deploy ***
+        // **************
+        stage("Deployment"){
+            when {
+                environment name: "GIT_BRANCH", value: "origin/main"
+            }
+
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${DOCKER_REG_CREDS}", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]){
+                    echo "***** Deploy Application *****"
+                    sh 'docker login ${DOCKER_REG} -u ${USERNAME} -p ${PASSWORD}'
+                    sh 'docker compose pull'
+                    sh 'docker compose up -d'
+                    sh 'docker ps'
+                }
+            }
+        }
+    }
+    post{
+        failure{
+            // slackSend (color: "#FF0000", message: "Job FAILED: '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            sh 'docker image rm ${APP_NAME}:test &> /dev/null || true'
+            sh 'DOCKER_TAG=test docker compose down --rmi all'
+        }
+    }
+}

@@ -131,6 +131,7 @@ def _chat_llm_json(system: str, user: str, schema: dict) -> Optional[Dict]:
     return None
 app = FastAPI(
     title="SKILLAB Demand Analysis API",
+    root_path="/organization-needs",
     description="Short-term and long-term skill/occupation demand analysis for US #23 and US #24.",
     version="1.0.0",
     # root_path="/demand_analysis",  # uncomment when running behind a proxy
