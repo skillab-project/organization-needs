@@ -7,9 +7,16 @@ services:
       - .env
     environment:
       - TRACKER_API=https://skillab-tracker.csd.auth.gr/api
-      - LLM_API_URL=http://160.40.52.27:3000/api
+      - LLM_API_URL=http://160.40.52.27:3000
     ports:
       - "8871:8000"
+    volumes:
+      - organization-needs_anlyses:/app/completed_anlyses
     labels:
       io.portainer.accesscontrol.teams: skillab-all
     restart: unless-stopped
+
+volumes:
+  organization-needs_anlyses:
+    labels:
+      io.portainer.accesscontrol.teams: skillab-all

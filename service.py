@@ -137,7 +137,7 @@ app = FastAPI(
     # root_path="/demand_analysis",  # uncomment when running behind a proxy
 )
 
-FOLDER = Path("completed_anlyses5")
+FOLDER = Path("completed_anlyses")
 
 
 # ══════════════════════════════════════════════════════════════════
