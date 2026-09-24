@@ -2,11 +2,16 @@
 demand_analysis.py
 ==================
 SKILLAB — Demand Analysis Service
-Endpoints:
-  GET /shorttermanalysis/skills       — US #23  Short-term skill demand (jobs only)
-  GET /shorttermanalysis/occupations  — US #24  Short-term occupation demand (jobs only)
-  GET /longtermanalysis/skills        — US #23  Long-term skill emergence (policies + projects + white papers)
-  GET /longtermanalysis/occupations   — US #24  Long-term occupation emergence (aggregated from skills via ESCO)
+Endpoints (all take ?organization=<name>):
+  GET /shorttermanalysis/skills       — US #23  Short-term skill demand
+  GET /shorttermanalysis/occupations  — US #24  Short-term occupation demand
+  GET /longtermanalysis/skills        — US #23  Long-term skill emergence (EMERGE, job-based)
+  GET /longtermanalysis/occupations   — US #24  Long-term occupation emergence (EMERGE, job-based)
+
+Every endpoint runs two analyses and returns both:
+  organization_analysis — job ads of the organization from the Hiring Management API
+  sector_analysis       — the organization's sectors are read from the Employee Management API,
+                          then job postings for each sector are pulled from the SKILLAB Tracker
 """
 
 import time
@@ -131,13 +136,12 @@ def _chat_llm_json(system: str, user: str, schema: dict) -> Optional[Dict]:
     return None
 app = FastAPI(
     title="SKILLAB Demand Analysis API",
-    root_path="/organization-needs",
     description="Short-term and long-term skill/occupation demand analysis for US #23 and US #24.",
     version="1.0.0",
     # root_path="/demand_analysis",  # uncomment when running behind a proxy
 )
 
-FOLDER = Path("completed_anlyses")
+FOLDER = Path("completed_anlyses5")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -149,25 +153,13 @@ def get_token() -> str:
     return res.text.replace('"', "")
 
 
-def _parse_csv_str(v: Optional[str]) -> Optional[List[str]]:
-    if not v:
-        return None
-    return [x.strip() for x in v.split(",") if x.strip()]
-
-
-def _parse_csv_int(v: Optional[str]) -> Optional[List[int]]:
-    if not v:
-        return None
-    return [int(x.strip()) for x in v.split(",") if x.strip()]
-
-
-def api_extract(request_body: dict, page: int, endpoint: str) -> dict:
+def api_extract(request_body: dict, page: int, endpoint: str, token: str) -> dict:
     """Single-page retrieval."""
     page_size = 300
     params = {"page": page, "page_size": page_size}
     data = req.post(
         f"{API}/{endpoint}",
-        headers={"Authorization": f"Bearer {get_token()}"},
+        headers={"Authorization": f"Bearer {token}"},
         params=params,
         data=request_body,
     )
@@ -179,7 +171,8 @@ def paginate_all(request_body: dict, endpoint: str) -> List[dict]:
     Retrieve every page from an endpoint and return a flat list of items.
     """
     log.info(f"[{endpoint}] fetching page 1...")
-    first = api_extract(request_body, page=1, endpoint=endpoint)
+    token = get_token()
+    first = api_extract(request_body, page=1, endpoint=endpoint, token=token)
     count = first.get("count", 0)
     n_pages = max(1, math.ceil(count / 300))
     log.info(f"[{endpoint}] {count} records found — {n_pages} page(s) total")
@@ -187,7 +180,7 @@ def paginate_all(request_body: dict, endpoint: str) -> List[dict]:
     items: List[dict] = list(first.get("items", []))
     for page in range(2, n_pages + 1):
         log.info(f"[{endpoint}] fetching page {page}/{n_pages}...")
-        chunk = api_extract(request_body, page=page, endpoint=endpoint)
+        chunk = api_extract(request_body, page=page, endpoint=endpoint, token=token)
         items.extend(chunk.get("items", []))
         time.sleep(0.3)  # polite rate-limiting
 
@@ -240,36 +233,12 @@ def _save_cache(file_path: str, data: Any) -> None:
     log.info(f"Saved cache: {file_path}")
 
 
-def _error_cache(file_path: str, exc: Exception) -> None:
-    log.error(f"Error in pipeline: {exc}")
-    _save_cache(file_path, {"status": "error", "message": str(exc), "result": None})
-
-
-# ── Sector extraction ────────────────────────────────────────────
-
-_SECTOR_FIELDS = ("sectors")
-
-def _extract_sectors(item: dict) -> List[str]:
-    """Return the list of sector codes attached to a job item."""
-    for field in _SECTOR_FIELDS:
-        val = item.get(field)
-        if val is None:
-            continue
-        if isinstance(val, list):
-            cleaned = [str(s).strip() for s in val if s]
-            return cleaned if cleaned else ["unknown"]
-        if isinstance(val, str) and val.strip():
-            return [val.strip()]
-    return ["unknown"]
-
-
-def _group_items_by_sector(items: List[dict]) -> Dict[str, List[dict]]:
-    """Partition job items by sector."""
-    groups: Dict[str, List[dict]] = defaultdict(list)
-    for item in items:
-        for sector in _extract_sectors(item):
-            groups[sector].append(item)
-    return dict(groups)
+def _occupations_of(item: dict) -> List[str]:
+    """Occupation keys of a job: a single name/URI (hiring) or a list of URIs (tracker)."""
+    occ = item.get("occupation_id") or item.get("occupations")
+    if not occ:
+        return []
+    return [str(o) for o in (occ if isinstance(occ, list) else [occ]) if o]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -330,9 +299,8 @@ def _build_occupation_series(items: List[dict], date_field: str = "upload_date")
         q = _to_quarter_str(item.get(date_field))
         if not q:
             continue
-        occ = item.get("occupation_id") or item.get("occupations")
-        if occ:
-            acc[str(occ)][q] += 1
+        for occ in _occupations_of(item):
+            acc[occ][q] += 1
     return {k: dict(v) for k, v in acc.items()}
 
 
@@ -893,50 +861,9 @@ def run_short_term_analysis(
     }
 
 
-# ── 2.8  Per-sector dispatcher ────────────────────────────────────
-
-def run_short_term_analysis_by_sector(
-    items:        List[dict],
-    mode:         str,
-    label_dict:   Dict[str, str],
-    top_n:        int = 50,
-    organization: str = "Unknown",
-    user_sector:  str = "Unknown",        # ← add
-) -> Dict[str, Dict]:
-    sector_groups = _group_items_by_sector(items)
-    log.info(f"[BySector] {len(sector_groups)} sector(s) found: {sorted(sector_groups)}")
-
-    results: Dict[str, Dict] = {}
-    n_sectors = len(sector_groups)
-    for i, (sector_code, sector_items) in enumerate(sorted(sector_groups.items()), 1):
-        log.info(f"[BySector {i}/{n_sectors}] '{sector_code}' — {len(sector_items)} items — starting {mode} analysis")
-        analysis = run_short_term_analysis(
-            sector_items, mode=mode, label_dict=label_dict, top_n=top_n,
-            sector=user_sector,           # ← use user's value instead of sector_code
-            organization=organization,
-        )
-        analysis["metadata"]["sector"] = user_sector    # ← same here
-        analysis["metadata"]["sector_item_count"] = len(sector_items)
-        results[sector_code] = analysis
-        log.info(f"[BySector {i}/{n_sectors}] '{sector_code}' DONE")
-
-    log.info(f"[BySector] All {n_sectors} sectors processed.")
-    return results
-
-
 # ══════════════════════════════════════════════════════════════════
-#  SECTION 3 — LONG-TERM ANALYSIS  (EMERGE framework)
+#  SECTION 3 — LONG-TERM ANALYSIS  (EMERGE framework, job-based)
 # ══════════════════════════════════════════════════════════════════
-
-IRT_PARAMS: Dict[str, Dict] = {
-    "whitepaper_density":     {"a": 0.8, "b": 0.20, "desc": "White paper publication density"},
-    "project_density":        {"a": 1.4, "b": 0.35, "desc": "R&D project funding signal"},
-    "policy_density":         {"a": 1.6, "b": 0.45, "desc": "Policy document mention density"},
-    "policy_intensity":       {"a": 2.0, "b": 0.52, "desc": "Policy language intensity (recent vs. all)"},
-    "geo_spread":             {"a": 1.3, "b": 0.40, "desc": "Geographic spread across EU"},
-    "cross_sector_adoption":  {"a": 1.5, "b": 0.55, "desc": "Cross-sector adoption signals (NACE diversity)"},
-    "yoy_growth_rate":        {"a": 1.8, "b": 0.38, "desc": "Year-over-year mention growth rate"},
-}
 
 JOB_IRT_PARAMS: Dict[str, Dict] = {
     "posting_density":       {"a": 1.2, "b": 0.25, "desc": "Skill frequency across job postings"},
@@ -946,6 +873,8 @@ JOB_IRT_PARAMS: Dict[str, Dict] = {
     "yoy_growth_rate":       {"a": 1.8, "b": 0.38, "desc": "Year-over-year posting growth rate"},
     "occupation_breadth":    {"a": 1.1, "b": 0.30, "desc": "Distinct occupations requiring this skill"},
 }
+
+
 def _irt_p(theta: float, a: float, b: float) -> float:
     try:
         return 1.0 / (1.0 + math.exp(-a * (theta - b)))
@@ -956,12 +885,17 @@ def _irt_p(theta: float, a: float, b: float) -> float:
 def _log_likelihood(theta: float, signal_vec: Dict[str, float]) -> float:
     ll = 0.0
     for key, val in signal_vec.items():
-        if key not in IRT_PARAMS:
+        p_params = JOB_IRT_PARAMS.get(key)
+        if p_params is None:
             continue
-        p_params = IRT_PARAMS[key]
         prob = float(np.clip(_irt_p(theta, p_params["a"], p_params["b"]), 1e-9, 1 - 1e-9))
         ll += val * math.log(prob) + (1 - val) * math.log(1 - prob)
     return ll
+
+
+def _grid_theta(signal_vec: Dict[str, float]) -> float:
+    grid = [i / 100.0 for i in range(1, 100)]
+    return max(grid, key=lambda th: _log_likelihood(th, signal_vec))
 
 
 def estimate_theta(signal_vec: Dict[str, float]) -> Tuple[float, float]:
@@ -992,11 +926,6 @@ def estimate_theta(signal_vec: Dict[str, float]) -> Tuple[float, float]:
     return round(theta_hat, 4), round(confidence, 4)
 
 
-def _grid_theta(signal_vec: Dict[str, float]) -> float:
-    grid = [i / 100.0 for i in range(1, 100)]
-    return max(grid, key=lambda th: _log_likelihood(th, signal_vec))
-
-
 FUZZY_SETS: Dict[str, Dict[str, float]] = {
     "speculative":  {"a": -0.10, "b": -0.10, "c": 0.22, "d": 0.45},
     "niche":        {"a":  0.30, "b":  0.42, "c": 0.54, "d": 0.66},
@@ -1014,10 +943,7 @@ def _trap(x: float, a: float, b: float, c: float, d: float) -> float:
 
 
 def fuzzy_memberships(theta: float) -> Dict[str, float]:
-    return {
-        label: round(_trap(theta, **p), 4)
-        for label, p in FUZZY_SETS.items()
-    }
+    return {label: round(_trap(theta, **p), 4) for label, p in FUZZY_SETS.items()}
 
 
 def dominant_category(memberships: Dict[str, float]) -> str:
@@ -1056,319 +982,79 @@ def _yoy_growth_signal(date_strings: List[Optional[str]]) -> float:
     return float(np.clip((growth + 1.0) / 2.0, 0.0, 1.0))
 
 
+def _item_geo(item: dict) -> str:
+    return str(item.get("country") or item.get("location_code") or "")
+
+
+def _item_sectors(item: dict) -> List[str]:
+    val = item.get("sectors")
+    if isinstance(val, list):
+        return [str(s) for s in val if s]
+    return [str(val)] if val else []
+
+
+def _available_signals(job_items: List[dict]) -> List[str]:
+    """
+    Hiring-management jobs carry no location or sector. Scoring those signals
+    as 0 would drag every theta down, so they are left out of the IRT model
+    when the dataset has no such field at all.
+    """
+    keys = ["posting_density", "recency_intensity", "yoy_growth_rate", "occupation_breadth"]
+    if any(_item_geo(it) for it in job_items):
+        keys.append("geo_spread")
+    if any(_item_sectors(it) for it in job_items):
+        keys.append("cross_sector_adoption")
+    return keys
+
+
 def compute_job_signals(
-    entity_uri:        str,
-    job_items:         List[dict],
-    total_job_count:   int,
+    entity_uri:      str,
+    job_items:       List[dict],
+    total_job_count: int,
+    signal_keys:     List[str],
 ) -> Dict[str, float]:
     docs = [it for it in job_items if entity_uri in it.get("skills", [])]
     if not docs:
-        return {k: 0.0 for k in JOB_IRT_PARAMS}
+        return {k: 0.0 for k in signal_keys}
 
-    posting_density = min(1.0, len(docs) / max(total_job_count * 0.3, 1))
+    geo_set  = {_item_geo(it)[:2].upper() for it in docs if _item_geo(it)}
+    nace_set = {s[:2].upper() for it in docs for s in _item_sectors(it)}
+    occ_set  = {o for it in docs for o in _occupations_of(it)}
+    recent   = [it for it in docs if _is_recent(it.get("upload_date"), years=1)]
 
-    recent = [it for it in docs if _is_recent(it.get("upload_date"), years=1)]
-    recency_intensity = min(1.0, len(recent) / len(docs))
-
-    geo_set = set()
-    for it in docs:
-        loc = it.get("country") or it.get("location_code") or ""
-        if loc:
-            geo_set.add(str(loc)[:2].upper())
-    geo_spread = min(1.0, len(geo_set) / 10.0)
-
-    nace_set = set()
-    for it in docs:
-        sectors = it.get("sectors")
-        if isinstance(sectors, list):
-            for s in sectors:
-                if s:
-                    nace_set.add(str(s)[:2].upper())
-        elif sectors:
-            nace_set.add(str(sectors)[:2].upper())
-    cross_sector = min(1.0, len(nace_set) / 5.0)
-
-    yoy = _yoy_growth_signal([it.get("upload_date") for it in docs])
-
-    occ_set = set()
-    for it in docs:
-        occ = it.get("occupation_id") or it.get("occupations")
-        if occ:
-            occ_set.add(str(occ))
-    occ_breadth = min(1.0, len(occ_set) / 10.0)
-
-    return {
-        "posting_density":       round(posting_density,   4),
-        "recency_intensity":     round(recency_intensity, 4),
-        "geo_spread":            round(geo_spread,        4),
-        "cross_sector_adoption": round(cross_sector,      4),
-        "yoy_growth_rate":       round(yoy,               4),
-        "occupation_breadth":    round(occ_breadth,       4),
+    all_signals = {
+        "posting_density":       min(1.0, len(docs) / max(total_job_count * 0.3, 1)),
+        "recency_intensity":     min(1.0, len(recent) / len(docs)),
+        "geo_spread":            min(1.0, len(geo_set) / 10.0),
+        "cross_sector_adoption": min(1.0, len(nace_set) / 5.0),
+        "yoy_growth_rate":       _yoy_growth_signal([it.get("upload_date") for it in docs]),
+        "occupation_breadth":    min(1.0, len(occ_set) / 10.0),
     }
-
-
-def compute_signals(
-    entity_uri:        str,
-    items_by_source:   Dict[str, List[dict]],
-    entity_doc_counts: Dict[str, int],
-) -> Dict[str, float]:
-    pol_items = items_by_source.get("policies",    [])
-    prj_items = items_by_source.get("projects",    [])
-    wp_items  = items_by_source.get("white_papers", [])
-    all_items = pol_items + prj_items + wp_items
-
-    def in_entity(lst: List[dict]) -> List[dict]:
-        return [it for it in lst if entity_uri in it.get("skills", [])]
-
-    pol_docs = in_entity(pol_items)
-    prj_docs = in_entity(prj_items)
-    wp_docs  = in_entity(wp_items)
-    all_docs = pol_docs + prj_docs + wp_docs
-
-    wp_density  = min(1.0, len(wp_docs)  / max(len(wp_items)  * 0.3, 1))
-    prj_density = min(1.0, len(prj_docs) / max(len(prj_items) * 0.3, 1))
-    pol_density = min(1.0, len(pol_docs) / max(len(pol_items) * 0.3, 1))
-
-    pol_intensity = (
-        min(1.0, len([it for it in pol_docs if _is_recent(
-            it.get("publication_date") or it.get("date"), years=2
-        )]) / len(pol_docs))
-        if pol_docs else 0.0
-    )
-
-    geo_set = set()
-    for it in all_docs:
-        loc = it.get("location_code") or it.get("country") or ""
-        if loc:
-            geo_set.add(str(loc)[:2].upper())
-    geo_spread = min(1.0, len(geo_set) / 10.0)
-
-    nace_set = set()
-    for it in all_docs:
-        nace = it.get("nace_code") or it.get("sector") or ""
-        if nace:
-            nace_set.add(str(nace)[:2].upper())
-    cross_sector = min(1.0, len(nace_set) / 5.0)
-
-    dates = [
-        it.get("publication_date") or it.get("start_date") or it.get("date")
-        for it in all_docs
-    ]
-    yoy = _yoy_growth_signal(dates)
-
-    return {
-        "whitepaper_density":    round(wp_density,    4),
-        "project_density":       round(prj_density,   4),
-        "policy_density":        round(pol_density,   4),
-        "policy_intensity":      round(pol_intensity, 4),
-        "geo_spread":            round(geo_spread,    4),
-        "cross_sector_adoption": round(cross_sector,  4),
-        "yoy_growth_rate":       round(yoy,           4),
-    }
-
-
-def _source_mix(entity_uri: str, items_by_source: Dict[str, List[dict]]) -> Dict[str, int]:
-    counts = {src: sum(1 for it in items if entity_uri in it.get("skills", []))
-              for src, items in items_by_source.items()}
-    total = sum(counts.values())
-    if total == 0:
-        return {src: 0 for src in items_by_source}
-    return {src: round(c / total * 100) for src, c in counts.items()}
+    return {k: round(all_signals[k], 4) for k in signal_keys}
 
 
 _LT_RECS: Dict[str, List[Dict]] = {
     "breakthrough": [
-        {
-            "action":  "Begin strategic workforce transformation now",
-            "detail":  "Emergence is imminent with high confidence. Begin workforce transformation immediately: identify capability gaps, establish dedicated competency centres, and initiate senior hires before the market tightens.",
-            "owner":   "C-Suite / Workforce Planning",
-            "urgency": "Immediate — within 6 months",
-        },
-        {
-            "action":  "Establish R&D and academic partnerships",
-            "detail":  "Co-fund or collaborate with the R&D projects already driving this technology. Early institutional partnerships provide preferential access to talent and proprietary know-how.",
-            "owner":   "Innovation Lead",
-            "urgency": "Within 12 months",
-        },
-        {
-            "action":  "Develop future-ready job description frameworks",
-            "detail":  "Define and publish role profiles and competency requirements before the market converges on standards. Early clarity accelerates targeted recruitment and creates an employer brand advantage.",
-            "owner":   "HR Strategy / L&D",
-            "urgency": "Within 12 months",
-        },
+        {"detail": "Emergence is imminent with high confidence. Begin workforce transformation immediately: identify capability gaps, establish dedicated competency centres, and initiate senior hires before the market tightens."},
+        {"detail": "Build sourcing partnerships with universities and training providers now. Early institutional partnerships provide preferential access to talent before competition for it peaks."},
+        {"detail": "Define and publish role profiles and competency requirements before the market converges on standards, and check them against upcoming regulatory requirements in your sector."},
     ],
     "emerging": [
-        {
-            "action":  "Launch exploratory internal capability programmes",
-            "detail":  "Establish pilot training to develop internal expertise. Identify 2–3 internal champions who can lead capability building as the technology approaches mainstream adoption.",
-            "owner":   "L&D Lead",
-            "urgency": "Within 12 months",
-        },
-        {
-            "action":  "Track regulatory trajectory",
-            "detail":  "Growing policy signals indicate increasing institutional attention. Monitor relevant EU regulatory developments (e.g. AI Act, Green Deal, ENISA guidelines) and pre-align internal capabilities with likely compliance requirements.",
-            "owner":   "Risk & Compliance",
-            "urgency": "Ongoing — quarterly review",
-        },
+        {"detail": "Establish pilot training to develop internal expertise. Identify 2–3 internal champions who can lead capability building as demand approaches the mainstream."},
+        {"detail": "Start building a talent pipeline through internships, traineeships and targeted partnerships while the market is still forming."},
+        {"detail": "Monitor relevant EU regulatory developments (e.g. AI Act, Green Deal, ENISA guidelines) and pre-align internal capabilities with likely compliance requirements."},
     ],
     "niche": [
-        {
-            "action":  "Assess strategic relevance before investing",
-            "detail":  "Niche signals exist but mainstream adoption remains uncertain. Conduct an internal strategic alignment review before committing training or recruitment budgets.",
-            "owner":   "HR Strategy",
-            "urgency": "At next strategy review cycle",
-        },
+        {"detail": "Niche signals exist but mainstream adoption remains uncertain. Conduct an internal strategic alignment review before committing training or recruitment budgets."},
+        {"detail": "Keep a light-touch relationship with specialist providers so you can source this capability on demand rather than building it in-house."},
+        {"detail": "No dedicated compliance action is warranted yet. Review at the next strategy cycle."},
     ],
     "speculative": [
-        {
-            "action":  "Horizon scanning only — do not invest yet",
-            "detail":  "Signals are predominantly from early-stage research. Maintain awareness through a horizon scanning programme (quarterly reviews of R&D publications and policy consultations) without committing organizational resources.",
-            "owner":   "Innovation / Strategy",
-            "urgency": "Horizon monitoring only",
-        },
+        {"detail": "Signals are weak across all dimensions. Maintain awareness through quarterly horizon scanning without committing organizational resources."},
+        {"detail": "No partnership investment is warranted yet. Revisit if posting volume or growth picks up."},
+        {"detail": "No compliance action is warranted at this stage."},
     ],
 }
-
-
-def _long_term_recommendations(
-        category: str,
-        entity_label: str,
-        theta: float,
-        tte: Dict,
-        signals: Dict[str, float],
-        source_mix: Optional[Dict[str, int]] = None,
-        sector: str = "Unknown",
-        entity_type: str = "skill",
-) -> Dict:
-    ci_width = tte["ci_upper_years"] - tte["ci_lower_years"]
-    ci_note = (
-        f" Note: the confidence interval spans {ci_width:.1f} years, indicating meaningful estimation uncertainty — "
-        "staged investment and quarterly signal reassessment are advised before committing large resources."
-        if ci_width > 2.0 else
-        f" The confidence interval is narrow ({ci_width:.1f} years), indicating a reliable projection."
-    )
-
-    # Dominant signal interpretation
-    pol = signals.get("policy_density", 0)
-    rd = signals.get("project_density", 0)
-    wp = signals.get("whitepaper_density", 0)
-    yoy = signals.get("yoy_growth_rate", 0)
-    geo = signals.get("geo_spread", 0)
-    cross = signals.get("cross_sector_adoption", 0)
-
-    strongest = max([("policy attention", pol), ("R&D funding", rd),
-                     ("industry white paper discourse", wp), ("year-on-year growth", yoy)],
-                    key=lambda x: x[1])
-
-    geo_interp = (
-        "broad EU-wide geographic spread" if geo > 0.6
-        else "moderate cross-country diffusion" if geo > 0.3
-        else "geographically concentrated — limited EU-wide diffusion so far"
-    )
-    cross_interp = (
-        "strong cross-sector adoption — resilient across multiple NACE contexts" if cross > 0.6
-        else "moderate cross-sector presence" if cross > 0.3
-        else "sector-concentrated — adoption not yet diffusing beyond primary sectors"
-    )
-
-    src = source_mix or {}
-
-    system = (
-        "You are a workforce strategy advisor generating long-term capability briefings "
-        "for a senior HR strategist using the SKILLAB EMERGE framework. "
-        "You MUST respond with valid JSON only — no prose, no numbered lists, no markdown. "
-        "Your entire response must be a single JSON object matching the required structure."
-    )
-
-    user = f"""You are preparing a 5-year capability briefing for the HR strategist 
-operating in the {sector} sector, based on the EMERGE framework applied to European 
-policy documents, R&D projects, and industry white papers.
-
-The analysis concerns the {entity_type} "{entity_label}".
-
-== EMERGE PROFILE ==
-
-Emergence Category:          {category.upper()}
-Emergence Quotient (EQ):     {round(theta * 100)} / 100
-Theta (latent maturity 0–1): {theta}
-
-Time-to-Emergence Projection:
-  Point estimate:             {tte.get("point_estimate_years")} years
-  Confidence interval:        {tte.get("ci_lower_years")} – {tte.get("ci_upper_years")} years
-  Interval assessment:       {ci_note}
-
-IRT Signal Profile (0–1 scale):
-  Policy document signal:     {pol} — {"strong institutional attention" if pol > 0.5 else "limited policy discourse so far"}
-  R&D project signal:         {rd} — {"active funded research pipeline" if rd > 0.5 else "limited R&D investment signal"}
-  White paper signal:         {wp} — {"industry has crystallised attention" if wp > 0.5 else "early-stage industry discourse"}
-  Year-on-year growth:        {yoy} — {"accelerating mentions" if yoy > 0.5 else "stable or slowing mentions"}
-  Geographic spread (EU):     {geo} — {geo_interp}
-  Cross-sector adoption:      {cross} — {cross_interp}
-  Strongest signal:           {strongest[0]} ({strongest[1]:.2f})
-
-Document Source Mix:
-  Policy documents:           {src.get("policies", "N/A")}%
-  R&D projects:               {src.get("projects", "N/A")}%
-  White papers:               {src.get("white_papers", "N/A")}%
-
-== EMERGENCE CATEGORY GUIDANCE ==
-
-BREAKTHROUGH → Technology is on the verge of mainstream labour market diffusion. 
-  Convey immediacy. Recommend decisive action within 6–12 months. 
-  Reference the short TTE and the strongest signal as the primary talent pipeline.
-
-EMERGING → Clear multi-signal confirmation but not yet mainstream. 
-  Convey active preparation. Recommend pilot programmes, partnership exploration, 
-  and regulatory monitoring. Reference the TTE range as the planning window.
-
-NICHE → Some signal exists but diffusion is narrow and uncertain. 
-  Convey cautious assessment. Recommend internal review before committing budgets. 
-  Reference geographic or cross-sector concentration as the risk factor.
-
-SPECULATIVE → Early-stage discourse only. 
-  Convey horizon monitoring. No resource commitment warranted. 
-  Reference low signal values and wide CI as the basis for restraint.
-
-== YOUR TASK ==
-
-Generate three recommendations, one per dimension:
-1. strategic_workforce_planning — 3–5 year capability investment and role pipeline
-2. partnerships_and_pipeline — university, R&D, and institutional partnerships
-3. regulatory_and_compliance — regulatory trajectory and compliance readiness
-
-Each recommendation MUST:
-- Be 3–4 sentences long
-- Address the HR strategist in second person ("you should...")
-- Cite at least two specific signal or projection values by number
-- Reference "{entity_label}" by name at least once
-- Reference the "{sector}" sector context
-- Apply the category guidance above — do not give generic foresight advice
-- Acknowledge uncertainty if the CI width exceeds 2 years
-- Avoid referencing any external knowledge about "{entity_label}" beyond what the metrics show
-"""
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "strategic_workforce_planning": {"type": "string"},
-            "partnerships_and_pipeline": {"type": "string"},
-            "regulatory_and_compliance": {"type": "string"},
-        },
-        "required": ["strategic_workforce_planning", "partnerships_and_pipeline", "regulatory_and_compliance"],
-        "additionalProperties": False,
-    }
-
-    result = _chat_llm_json(system, user, schema)
-    if result:
-        return result
-
-    log.warning(f"[Recs] LLM failed for '{entity_label}' — using static fallback")
-    static = _LT_RECS.get(category, _LT_RECS["niche"])
-    return {
-        "strategic_workforce_planning": static[0]["detail"] if len(static) > 0 else "",
-        "partnerships_and_pipeline": static[1]["detail"] if len(static) > 1 else static[0]["detail"],
-        "regulatory_and_compliance": static[-1]["detail"],
-    }
 
 
 def _long_term_job_recommendations(
@@ -1378,7 +1064,8 @@ def _long_term_job_recommendations(
         tte: Dict,
         signals: Dict[str, float],
         sector: str = "Unknown",
-        entity_type: str = "occupation",
+        entity_type: str = "skill",
+        data_scope: str = "sector",
 ) -> Dict:
     ci_width = tte["ci_upper_years"] - tte["ci_lower_years"]
     ci_note = (
@@ -1388,29 +1075,35 @@ def _long_term_job_recommendations(
         f" The projection confidence interval is narrow ({ci_width:.1f} years), supporting reliable planning."
     )
 
-    pd_ = signals.get("posting_density", 0)
-    ri = signals.get("recency_intensity", 0)
-    geo = signals.get("geo_spread", 0)
-    cross = signals.get("cross_sector_adoption", 0)
-    yoy = signals.get("yoy_growth_rate", 0)
-    occ = signals.get("occupation_breadth", 0)
-
-    pd_interp = "high volume of job postings" if pd_ > 0.5 else "limited posting volume so far"
-    ri_interp = "recent postings dominating — strong recency signal" if ri > 0.6 else "postings distributed across historical window — no strong recency surge"
-    occ_interp = "required across a broad range of occupational roles" if occ > 0.6 else "concentrated within a narrow occupational cluster"
+    interp = {
+        "posting_density":       lambda v: "high volume of job postings" if v > 0.5 else "limited posting volume so far",
+        "recency_intensity":     lambda v: "recent postings dominating — strong recency signal" if v > 0.6 else "postings spread across the historical window — no strong recency surge",
+        "geo_spread":            lambda v: "broad multi-country presence" if v > 0.5 else "geographically concentrated postings",
+        "cross_sector_adoption": lambda v: "demanded across multiple NACE sectors" if v > 0.5 else "sector-concentrated demand",
+        "yoy_growth_rate":       lambda v: "accelerating posting volume" if v > 0.5 else "stable or slowing posting volume",
+        "occupation_breadth":    lambda v: "required across a broad range of occupational roles" if v > 0.6 else "concentrated within a narrow occupational cluster",
+    }
+    signal_lines = "\n".join(
+        f"  {JOB_IRT_PARAMS[k]['desc']:<45} {v} — {interp[k](v)}"
+        for k, v in signals.items() if k in interp
+    )
+    scope_text = (
+        f"the job ads of the organization (hiring-management data, sector context: {sector})"
+        if data_scope == "organization" else
+        f"job postings in the {sector} sector (SKILLAB Tracker data)"
+    )
 
     system = (
-        "You are a workforce strategy advisor generating long-term occupation capability briefings "
+        "You are a workforce strategy advisor generating long-term capability briefings "
         "for a senior HR strategist using the SKILLAB EMERGE framework applied to job posting data. "
         "You MUST respond with valid JSON only — no prose, no numbered lists, no markdown. "
         "Your entire response must be a single JSON object matching the required structure."
     )
 
-    user = f"""You are preparing a 5-year capability briefing for the HR strategist 
-operating in the {sector} sector. This analysis is derived from job posting data 
-(not policy or research documents) using the EMERGE framework.
+    user = f"""You are preparing a 5-year capability briefing for an HR strategist.
+This analysis is derived from {scope_text} using the EMERGE framework.
 
-The analysis concerns the {entity_type} "{entity_label}" in the {sector} sector.
+The analysis concerns the {entity_type} "{entity_label}".
 
 == EMERGE PROFILE (JOB-BASED) ==
 
@@ -1424,37 +1117,30 @@ Time-to-Emergence Projection:
   Interval assessment:       {ci_note}
 
 Job Market Signal Profile (0–1 scale):
-  Posting density:            {pd_} — {pd_interp}
-  Recency intensity:          {ri} — {ri_interp}
-  Geographic spread:          {geo} — {"broad multi-country presence" if geo > 0.5 else "geographically concentrated postings"}
-  Cross-sector adoption:      {cross} — {"demanded across multiple NACE sectors" if cross > 0.5 else "sector-concentrated demand"}
-  Year-on-year growth:        {yoy} — {"accelerating posting volume" if yoy > 0.5 else "stable or slowing posting volume"}
-  Occupation breadth:         {occ} — {occ_interp}
+{signal_lines}
 
 == EMERGENCE CATEGORY GUIDANCE ==
 
 BREAKTHROUGH → Posting signals confirm imminent mainstream labour market diffusion.
-  Convey immediacy. Decisive action within 6–12 months. 
+  Convey immediacy. Decisive action within 6–12 months.
   Reference TTE and the strongest job market signal.
 
 EMERGING → Multiple job market signals confirm trajectory but mainstream not yet reached.
   Convey active preparation. Pilot programmes, pipeline building, partnership exploration.
   Reference TTE range as the planning window.
 
-NICHE → Some signal exists but posting volume and geographic spread remain narrow.
+NICHE → Some signal exists but posting volume and spread remain narrow.
   Convey cautious assessment before committing L&D or recruitment budgets.
-  Reference concentration risk (geographic or cross-sector).
 
 SPECULATIVE → Weak signals across all dimensions.
   Convey horizon monitoring only. No resource commitment warranted.
-  Reference low signal values as the basis for restraint.
 
 == YOUR TASK ==
 
 Generate three recommendations, one per dimension:
 1. strategic_workforce_planning — 3–5 year role pipeline and capability investment
 2. partnerships_and_pipeline — talent sourcing partnerships and pipeline development
-3. regulatory_and_compliance — compliance readiness relevant to this occupation in {sector}
+3. regulatory_and_compliance — compliance readiness relevant to this {entity_type} in {sector}
 
 Each recommendation MUST:
 - Be 3–4 sentences long
@@ -1471,8 +1157,8 @@ Each recommendation MUST:
         "type": "object",
         "properties": {
             "strategic_workforce_planning": {"type": "string"},
-            "partnerships_and_pipeline": {"type": "string"},
-            "regulatory_and_compliance": {"type": "string"},
+            "partnerships_and_pipeline":    {"type": "string"},
+            "regulatory_and_compliance":    {"type": "string"},
         },
         "required": ["strategic_workforce_planning", "partnerships_and_pipeline", "regulatory_and_compliance"],
         "additionalProperties": False,
@@ -1485,17 +1171,21 @@ Each recommendation MUST:
     log.warning(f"[Recs] LLM failed for '{entity_label}' — using static fallback")
     static = _LT_RECS.get(category, _LT_RECS["niche"])
     return {
-        "strategic_workforce_planning": static[0]["detail"] if len(static) > 0 else "",
-        "partnerships_and_pipeline": static[1]["detail"] if len(static) > 1 else static[0]["detail"],
-        "regulatory_and_compliance": static[-1]["detail"],
+        "strategic_workforce_planning": static[0]["detail"],
+        "partnerships_and_pipeline":    static[1]["detail"],
+        "regulatory_and_compliance":    static[2]["detail"],
     }
 
+
 def run_long_term_skills_from_jobs(
-    job_items:  List[dict],
-    label_dict: Dict[str, str],
-    top_n:      int = 50,
+    job_items:        List[dict],
+    label_dict:       Dict[str, str],
+    top_n:            int = 50,
+    sector:           str = "Unknown",
+    data_scope:       str = "sector",
+    with_recommendations: bool = True,
 ) -> Dict:
-    log.info("[LT/Skills/Jobs] starting long-term skill emergence pipeline from jobs")
+    log.info(f"[LT/Skills] starting on {len(job_items)} jobs, top_n={top_n}, recs={with_recommendations}")
 
     skill_counts: Dict[str, int] = defaultdict(int)
     for item in job_items:
@@ -1503,40 +1193,46 @@ def run_long_term_skills_from_jobs(
             skill_counts[skill] += 1
 
     if not skill_counts:
-        log.warning("[LT/Skills/Jobs] no skills found — returning empty result")
+        log.warning("[LT/Skills] no skills found — returning empty result")
         return {"metadata": {}, "skills": [], "sector_summary": {"total_entities_analyzed": 0}}
 
+    signal_keys = _available_signals(job_items)
     top_skills = sorted(skill_counts, key=skill_counts.get, reverse=True)[:top_n]
-    log.info(f"[LT/Skills/Jobs] {len(skill_counts)} unique skills, analyzing top {len(top_skills)}")
+    log.info(f"[LT/Skills] {len(skill_counts)} unique skills, analyzing top {len(top_skills)} "
+             f"with signals {signal_keys}")
 
     results = []
     for idx, uri in enumerate(top_skills, 1):
-        if idx % 10 == 0 or idx == len(top_skills):
-            log.info(f"  ...EMERGE/Jobs progress: {idx}/{len(top_skills)}")
+        if idx % 25 == 0 or idx == len(top_skills):
+            log.info(f"  ...EMERGE progress: {idx}/{len(top_skills)}")
 
-        signals     = compute_job_signals(uri, job_items, len(job_items))
+        signals     = compute_job_signals(uri, job_items, len(job_items), signal_keys)
         theta, conf = estimate_theta(signals)
         membs       = fuzzy_memberships(theta)
         dom_cat     = dominant_category(membs)
         tte         = time_to_emergence(theta, conf)
         label       = label_dict.get(uri, uri)
-        recs        = _long_term_recommendations(dom_cat, label, theta, tte, signals)
+        recs = (
+            _long_term_job_recommendations(dom_cat, label, theta, tte, signals,
+                                           sector=sector, entity_type="skill", data_scope=data_scope)
+            if with_recommendations else None
+        )
 
         results.append({
-            "uri":                   uri,
-            "label":                 label,
-            "emergence_quotient":    round(theta * 100),
-            "theta":                 theta,
-            "confidence":            conf,
-            "time_to_emergence":     tte,
-            "dominant_category":     dom_cat,
-            "fuzzy_memberships":     membs,
-            "irt_signals":           {
+            "uri":                uri,
+            "label":              label,
+            "emergence_quotient": round(theta * 100),
+            "theta":              theta,
+            "confidence":         conf,
+            "time_to_emergence":  tte,
+            "dominant_category":  dom_cat,
+            "fuzzy_memberships":  membs,
+            "irt_signals":        {
                 k: {"value": v, "description": JOB_IRT_PARAMS[k]["desc"]}
                 for k, v in signals.items()
             },
-            "total_job_mentions":    skill_counts.get(uri, 0),
-            "recommendations":       recs,
+            "total_job_mentions": skill_counts.get(uri, 0),
+            "recommendations":    recs,
         })
 
     results.sort(key=lambda x: x["theta"], reverse=True)
@@ -1545,222 +1241,125 @@ def run_long_term_skills_from_jobs(
     for r in results:
         cat_dist[r["dominant_category"]] += 1
 
-    log.info(f"[LT/Skills/Jobs] COMPLETE: {len(results)} skills — {dict(cat_dist)}")
+    log.info(f"[LT/Skills] COMPLETE: {len(results)} skills — {dict(cat_dist)}")
 
     return {
         "metadata": {
             "analysis_type":           "long_term_skills_from_jobs",
             "framework":               "EMERGE (IRT 2PL + Trapezoidal Fuzzy Logic)",
             "forecast_horizon_years":  5,
-            "n_irt_signals":           len(JOB_IRT_PARAMS),
+            "irt_signals_used":        signal_keys,
             "fuzzy_sets":              list(FUZZY_SETS.keys()),
             "total_records_retrieved": len(job_items),
             "analysis_date":           datetime.now().isoformat(),
         },
         "skills": results,
         "sector_summary": {
-            "total_entities_analyzed":  len(results),
-            "total_jobs_ingested":      len(job_items),
-            "category_distribution":    dict(cat_dist),
-            "top_breakthrough":         [r["label"] for r in results if r["dominant_category"] == "breakthrough"][:3],
-            "top_emerging":             [r["label"] for r in results if r["dominant_category"] == "emerging"][:3],
-            "top_speculative":          [r["label"] for r in results if r["dominant_category"] == "speculative"][:3],
+            "total_entities_analyzed": len(results),
+            "total_jobs_ingested":     len(job_items),
+            "category_distribution":   dict(cat_dist),
+            "top_breakthrough":        [r["label"] for r in results if r["dominant_category"] == "breakthrough"][:3],
+            "top_emerging":            [r["label"] for r in results if r["dominant_category"] == "emerging"][:3],
+            "top_speculative":         [r["label"] for r in results if r["dominant_category"] == "speculative"][:3],
         },
     }
 
-def run_long_term_skills(
-    items_by_source: Dict[str, List[dict]],
-    label_dict:      Dict[str, str],
-    top_n:           int = 50,
-) -> Dict:
-    log.info("[LT/Skills] starting long-term skill emergence pipeline")
-    all_items = [it for src in items_by_source.values() for it in src]
-
-    log.info("[LT/Skills] counting skill appearances across the corpus...")
-    skill_counts: Dict[str, int] = defaultdict(int)
-    for item in all_items:
-        for skill in item.get("skills", []):
-            skill_counts[skill] += 1
-
-    if not skill_counts:
-        log.warning("[LT/Skills] no skills found in corpus — returning empty result")
-        return {"metadata": {}, "skills": [], "sector_summary": {"total_entities_analyzed": 0}}
-
-    top_skills = sorted(skill_counts, key=skill_counts.get, reverse=True)[:top_n]
-    log.info(f"[LT/Skills] {len(skill_counts)} unique skills found, analyzing top {len(top_skills)}")
-
-    results = []
-    for idx, uri in enumerate(top_skills, 1):
-        if idx % 10 == 0 or idx == len(top_skills):
-            log.info(f"  ...EMERGE progress: {idx}/{len(top_skills)}")
-        signals    = compute_signals(uri, items_by_source, dict(skill_counts))
-        theta, conf = estimate_theta(signals)
-        membs      = fuzzy_memberships(theta)
-        dom_cat    = dominant_category(membs)
-        tte        = time_to_emergence(theta, conf)
-        src_mix    = _source_mix(uri, items_by_source)
-        label      = label_dict.get(uri, uri)
-        recs = _long_term_recommendations(
-            dom_cat, label, theta, tte, signals,
-            source_mix=_source_mix(uri, items_by_source),
-            entity_type="skill",
-        )
-
-        results.append({
-            "uri":                    uri,
-            "label":                  label,
-            "emergence_quotient":     round(theta * 100),
-            "theta":                  theta,
-            "confidence":             conf,
-            "time_to_emergence":      tte,
-            "dominant_category":      dom_cat,
-            "fuzzy_memberships":      membs,
-            "irt_signals":            {
-                k: {"value": v, "description": IRT_PARAMS[k]["desc"]}
-                for k, v in signals.items()
-            },
-            "source_mix_pct":         src_mix,
-            "total_document_mentions": skill_counts.get(uri, 0),
-            "recommendations":        recs,
-        })
-
-    results.sort(key=lambda x: x["theta"], reverse=True)
-
-    cat_dist: Dict[str, int] = defaultdict(int)
-    for r in results:
-        cat_dist[r["dominant_category"]] += 1
-
-    log.info(f"[LT/Skills] COMPLETE: {len(results)} skills classified — {dict(cat_dist)}")
-
-    return {
-        "metadata": {
-            "analysis_type":           "long_term_skills",
-            "framework":               "EMERGE (IRT 2PL + Trapezoidal Fuzzy Logic)",
-            "forecast_horizon_years":  5,
-            "n_irt_signals":           len(IRT_PARAMS),
-            "fuzzy_sets":              list(FUZZY_SETS.keys()),
-            "total_records_retrieved": len(all_items),
-            "analysis_date":           datetime.now().isoformat(),
-        },
-        "skills": results,
-        "sector_summary": {
-            "total_entities_analyzed":   len(results),
-            "total_documents_ingested":  len(all_items),
-            "documents_by_source":       {src: len(items) for src, items in items_by_source.items()},
-            "category_distribution":     dict(cat_dist),
-            "top_breakthrough":          [r["label"] for r in results if r["dominant_category"] == "breakthrough"][:3],
-            "top_emerging":              [r["label"] for r in results if r["dominant_category"] == "emerging"][:3],
-            "top_speculative":           [r["label"] for r in results if r["dominant_category"] == "speculative"][:3],
-        },
-    }
 
 def run_long_term_occupations_from_jobs(
     job_items:  List[dict],
     label_dict: Dict[str, str],
     top_n:      int = 50,
-    sector: str = "Unknown"
+    sector:     str = "Unknown",
+    data_scope: str = "sector",
 ) -> Dict:
-    log.info("[LT/Occupations/Jobs] starting long-term occupation emergence pipeline from jobs")
+    log.info(f"[LT/Occupations] starting on {len(job_items)} jobs, top_n={top_n}")
     total_jobs = len(job_items)
 
-    # Step 1: compute skill-level thetas from jobs
-    log.info("[LT/Occupations/Jobs] Step 1: computing skill thetas from jobs...")
-    skills_output = run_long_term_skills_from_jobs(job_items, label_dict, top_n=500)
-    skill_theta_map: Dict[str, Tuple[float, float]] = {
-        s["uri"]: (s["theta"], s["confidence"])
-        for s in skills_output.get("skills", [])
-    }
-    log.info(f"[LT/Occupations/Jobs] Step 1 done: {len(skill_theta_map)} skill thetas computed")
+    # Step 1: skill thetas and signals, without LLM calls
+    skills_output = run_long_term_skills_from_jobs(
+        job_items, label_dict, top_n=500, with_recommendations=False,
+    )
+    skill_info: Dict[str, Dict] = {s["uri"]: s for s in skills_output.get("skills", [])}
+    log.info(f"[LT/Occupations] Step 1 done: {len(skill_info)} skill thetas computed")
 
-    if not skill_theta_map:
-        log.warning("[LT/Occupations/Jobs] no skill thetas — returning empty result")
+    if not skill_info:
         return {"metadata": {}, "occupations": [], "sector_summary": {"total_occupations_analyzed": 0}}
 
-    # Step 2: build occupation→skill map directly from job co-occurrence
-    log.info("[LT/Occupations/Jobs] Step 2: building occupation→skill map from jobs...")
-    occ_skills_map: Dict[str, List[str]] = defaultdict(list)
+    # Step 2: occupation → skills from co-occurrence in the job postings
+    occ_skills_map: Dict[str, set] = defaultdict(set)
     for item in job_items:
-        occ = item.get("occupation_id") or item.get("occupations")
-        if occ:
-            # handle both single URI and list of URIs
-            occ_list = occ if isinstance(occ, list) else [occ]
-            for single_occ in occ_list:
-                if single_occ:
-                    for skill in item.get("skills", []):
-                        occ_skills_map[str(single_occ)].append(skill)
+        for occ in _occupations_of(item):
+            occ_skills_map[occ].update(item.get("skills", []))
 
     if not occ_skills_map:
-        log.warning("[LT/Occupations/Jobs] no occupation-skill mapping found — returning empty result")
         return {
             "metadata":       {},
             "occupations":    [],
             "sector_summary": {"total_occupations_analyzed": 0, "reason": "No occupation-skill mapping found."},
         }
 
-    # Step 3: aggregate skill thetas to occupation level
-    log.info(f"[LT/Occupations/Jobs] Step 3: aggregating across {len(occ_skills_map)} occupations...")
-    occ_results = []
-    for idx, (occ_uri, assoc_skills) in enumerate(occ_skills_map.items(), 1):
-        if idx % 25 == 0:
-            log.info(f"  ...aggregation progress: {idx}/{len(occ_skills_map)}")
-
-        theta_conf_pairs = [
-            skill_theta_map[s] for s in assoc_skills if s in skill_theta_map
-        ]
-        if not theta_conf_pairs:
+    # Step 3: aggregate skill thetas and signals to occupation level
+    log.info(f"[LT/Occupations] Step 3: aggregating across {len(occ_skills_map)} occupations...")
+    scored = []
+    for occ_uri, assoc_skills in occ_skills_map.items():
+        known = [skill_info[s] for s in assoc_skills if s in skill_info]
+        if not known:
             continue
+        thetas    = [s["theta"] for s in known]
+        agg_theta = float(np.average(thetas, weights=np.array(thetas) + 0.01))
+        agg_conf  = float(np.mean([s["confidence"] for s in known]))
 
-        thetas    = [tc[0] for tc in theta_conf_pairs]
-        confs     = [tc[1] for tc in theta_conf_pairs]
-        weights   = np.array(thetas) + 0.01
-        agg_theta = float(np.average(thetas, weights=weights))
-        agg_conf  = float(np.mean(confs))
-
-        membs   = fuzzy_memberships(agg_theta)
-        dom_cat = dominant_category(membs)
-        tte     = time_to_emergence(agg_theta, agg_conf)
-        label   = label_dict.get(occ_uri, occ_uri)
-
-        # aggregate job signals across constituent skills
         agg_sigs: Dict[str, List[float]] = defaultdict(list)
-        for s_uri in assoc_skills:
-            if s_uri in skill_theta_map:
-                s_signals = compute_job_signals(s_uri, job_items, total_jobs)
-                for k, v in s_signals.items():
-                    agg_sigs[k].append(v)
-        final_sigs = {k: round(float(np.mean(v)), 4) for k, v in agg_sigs.items()}
+        for s in known:
+            for k, v in s["irt_signals"].items():
+                agg_sigs[k].append(v["value"])
 
-        recs = _long_term_job_recommendations(
-            dom_cat, label, theta, tte, signals,
-            sector=sector,
-            entity_type="skill",
-        )
-
-        occ_results.append({
-            "uri":                  occ_uri,
-            "label":                label,
-            "emergence_quotient":   round(agg_theta * 100),
-            "theta":                round(agg_theta, 4),
-            "confidence":           round(agg_conf, 4),
-            "time_to_emergence":    tte,
-            "dominant_category":    dom_cat,
-            "fuzzy_memberships":    membs,
-            "irt_signals":          {
-                k: {"value": v, "description": JOB_IRT_PARAMS.get(k, {}).get("desc", k)}
-                for k, v in final_sigs.items()
-            },
-            "n_associated_skills":  len(assoc_skills),
-            "recommendations":      recs,
+        scored.append({
+            "uri":                 occ_uri,
+            "theta":               round(agg_theta, 4),
+            "confidence":          round(agg_conf, 4),
+            "signals":             {k: round(float(np.mean(v)), 4) for k, v in agg_sigs.items()},
+            "n_associated_skills": len(assoc_skills),
         })
 
-    occ_results.sort(key=lambda x: x["theta"], reverse=True)
-    occ_results = occ_results[:top_n]
+    # Keep top_n before calling the LLM, so recommendations are only built for returned rows
+    scored.sort(key=lambda x: x["theta"], reverse=True)
+    scored = scored[:top_n]
+
+    occ_results = []
+    for idx, occ in enumerate(scored, 1):
+        if idx % 10 == 0 or idx == len(scored):
+            log.info(f"  ...occupation recommendations: {idx}/{len(scored)}")
+        membs   = fuzzy_memberships(occ["theta"])
+        dom_cat = dominant_category(membs)
+        tte     = time_to_emergence(occ["theta"], occ["confidence"])
+        label   = label_dict.get(occ["uri"], occ["uri"])
+        recs = _long_term_job_recommendations(
+            dom_cat, label, occ["theta"], tte, occ["signals"],
+            sector=sector, entity_type="occupation", data_scope=data_scope,
+        )
+        occ_results.append({
+            "uri":                 occ["uri"],
+            "label":               label,
+            "emergence_quotient":  round(occ["theta"] * 100),
+            "theta":               occ["theta"],
+            "confidence":          occ["confidence"],
+            "time_to_emergence":   tte,
+            "dominant_category":   dom_cat,
+            "fuzzy_memberships":   membs,
+            "irt_signals":         {
+                k: {"value": v, "description": JOB_IRT_PARAMS[k]["desc"]}
+                for k, v in occ["signals"].items()
+            },
+            "n_associated_skills": occ["n_associated_skills"],
+            "recommendations":     recs,
+        })
 
     cat_dist: Dict[str, int] = defaultdict(int)
     for r in occ_results:
         cat_dist[r["dominant_category"]] += 1
 
-    log.info(f"[LT/Occupations/Jobs] COMPLETE: {len(occ_results)} occupations — {dict(cat_dist)}")
+    log.info(f"[LT/Occupations] COMPLETE: {len(occ_results)} occupations — {dict(cat_dist)}")
 
     return {
         "metadata": {
@@ -1768,6 +1367,7 @@ def run_long_term_occupations_from_jobs(
             "framework":               "EMERGE (IRT 2PL + Fuzzy Logic) — Job-based Skill Aggregation",
             "forecast_horizon_years":  5,
             "aggregation_method":      "theta-weighted mean of constituent skill scores",
+            "irt_signals_used":        skills_output["metadata"].get("irt_signals_used"),
             "total_records_retrieved": total_jobs,
             "analysis_date":           datetime.now().isoformat(),
         },
@@ -1782,144 +1382,130 @@ def run_long_term_occupations_from_jobs(
     }
 
 
-def run_long_term_occupations(
-    items_by_source: Dict[str, List[dict]],
-    label_dict:      Dict[str, str],
-    esco_df:         pd.DataFrame,
-    sector:          str,
-    top_n:           int = 50,
-) -> Dict:
-    log.info("[LT/Occupations] starting long-term occupation emergence pipeline")
-    all_items = [it for src in items_by_source.values() for it in src]
-    total_docs = len(all_items)
+# ══════════════════════════════════════════════════════════════════
+#  SECTION 4 — DATA SOURCES
+# ══════════════════════════════════════════════════════════════════
 
-    log.info("[LT/Occupations] Step 1: running skill-level EMERGE analysis...")
-    skills_output = run_long_term_skills(items_by_source, label_dict, top_n=500)
-    skill_theta_map: Dict[str, Tuple[float, float]] = {
-        s["uri"]: (s["theta"], s["confidence"])
-        for s in skills_output.get("skills", [])
-    }
-    log.info(f"[LT/Occupations] Step 1 done: {len(skill_theta_map)} skill thetas computed")
+HIRING_API       = os.getenv("HIRING_API",   "https://portal.skillab-project.eu/hiring-management").rstrip("/")
+EMPLOYEE_API     = os.getenv("EMPLOYEE_API", "https://portal.skillab-project.eu/employee-management").rstrip("/")
+PORTAL_API_TOKEN = os.getenv("PORTAL_API_TOKEN")  # optional, only if the portal gateway requires one
+TRACKER_YEARS_BACK = int(os.getenv("TRACKER_YEARS_BACK", "3"))
 
-    if not skill_theta_map:
-        log.warning("[LT/Occupations] no skill thetas available — returning empty result")
-        return {"metadata": {}, "occupations": [], "sector_summary": {"total_occupations_analyzed": 0}}
 
-    log.info("[LT/Occupations] Step 2: building occupation→skill mapping...")
-    occ_skills_map: Dict[str, List[str]] = defaultdict(list)
+def _portal_get(url: str, organization: Optional[str] = None, required: bool = False) -> Any:
+    """GET on the SKILLAB portal with 3 attempts. Returns None on failure unless required=True."""
+    headers = {"Accept": "application/json"}
+    if organization:
+        headers["X-User-Organization"] = organization
+    if PORTAL_API_TOKEN:
+        headers["Authorization"] = f"Bearer {PORTAL_API_TOKEN}"
+    for attempt in range(3):
+        try:
+            resp = req.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            log.warning(f"[Portal] GET {url} attempt {attempt + 1} failed: {exc}")
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+    if required:
+        raise RuntimeError(f"Portal request failed: {url}")
+    return None
 
-    if "occupation_uri" in esco_df.columns and "conceptUri" in esco_df.columns:
-        log.info("[LT/Occupations] Using explicit ESCO occupation_uri mapping.")
-        for _, row in esco_df.iterrows():
-            occ = row.get("occupation_uri")
-            skill = row.get("conceptUri")
-            if occ and skill and not pd.isna(occ) and not pd.isna(skill):
-                occ_skills_map[str(occ)].append(str(skill))
-    else:
-        log.info("[LT/Occupations] No occupation_uri column — using job co-occurrence fallback.")
-        job_body = {
-            "sectors":        sector,
-            "min_upload_date":  (datetime.now().replace(year=datetime.now().year - 5)).strftime("%Y-%m-%d"),
-            "max_upload_date":  datetime.now().strftime("%Y-%m-%d"),
-        }
-        job_items = paginate_all(job_body, endpoint="jobs")
-        for item in job_items:
-            occ = item.get("occupation_id") or item.get("occupation")
-            if occ:
-                for skill in item.get("skills", []):
-                    occ_skills_map[str(occ)].append(skill)
 
-    if not occ_skills_map:
-        log.warning("[LT/Occupations] no occupation-skill mapping found — returning empty result")
-        return {
-            "metadata": {},
-            "occupations": [],
-            "sector_summary": {"total_occupations_analyzed": 0, "reason": "No occupation-skill mapping found."},
-        }
+# ── 4.1  Organization data: Hiring Management ────────────────────
 
-    log.info(f"[LT/Occupations] Step 3: aggregating theta across {len(occ_skills_map)} occupations...")
-    occ_results = []
-    for idx, (occ_uri, assoc_skills) in enumerate(occ_skills_map.items(), 1):
-        if idx % 25 == 0:
-            log.info(f"  ...aggregation progress: {idx}/{len(occ_skills_map)}")
-        theta_conf_pairs = [
-            skill_theta_map[s] for s in assoc_skills if s in skill_theta_map
-        ]
-        if not theta_conf_pairs:
+def fetch_org_jobs(organization: str) -> Tuple[List[dict], Dict[str, str]]:
+    """
+    Pull every job ad of an organization from the Hiring Management API and
+    reshape it into the item format the pipelines expect:
+        {"id", "upload_date", "occupations", "skills": [skill_id, ...]}
+    Returns (items, skill_labels) with skill_labels mapping skill_id -> title.
+    """
+    ads = _portal_get(f"{HIRING_API}/api/v1/jobAds", organization, required=True) or []
+    log.info(f"[Hiring] {len(ads)} job ads for '{organization}'")
+
+    items: List[dict] = []
+    skill_labels: Dict[str, str] = {}
+    for idx, ad in enumerate(ads, 1):
+        job_id = ad.get("id")
+        if job_id is None:
             continue
 
-        thetas = [tc[0] for tc in theta_conf_pairs]
-        confs  = [tc[1] for tc in theta_conf_pairs]
+        # The summary has no date; the full job ad has publishDate
+        detail = _portal_get(f"{HIRING_API}/api/v1/jobAds/{job_id}", organization) or {}
+        skills = _portal_get(f"{HIRING_API}/api/v1/jobAds/{job_id}/interview-skills", organization) or []
 
-        weights  = np.array(thetas) + 0.01
-        agg_theta = float(np.average(thetas, weights=weights))
-        agg_conf  = float(np.mean(confs))
+        skill_ids = set()
+        for s in skills:
+            if s.get("id") is None:
+                continue
+            sid = str(s["id"])
+            skill_ids.add(sid)
+            skill_labels[sid] = s.get("title") or sid
 
-        membs   = fuzzy_memberships(agg_theta)
-        dom_cat = dominant_category(membs)
-        tte     = time_to_emergence(agg_theta, agg_conf)
-        label   = label_dict.get(occ_uri, occ_uri)
+        occupation = ad.get("occupationName") or (detail.get("occupation") or {}).get("title")
 
-        agg_sigs: Dict[str, List[float]] = defaultdict(list)
-        for s_uri in assoc_skills:
-            if s_uri in skill_theta_map:
-                s_signals = compute_signals(s_uri, items_by_source,
-                                            {u: 1 for u in assoc_skills})
-                for k, v in s_signals.items():
-                    agg_sigs[k].append(v)
-        final_sigs = {k: round(float(np.mean(v)), 4) for k, v in agg_sigs.items()}
-
-        recs = _long_term_recommendations(dom_cat, label, agg_theta, tte, final_sigs)
-
-        occ_results.append({
-            "uri":                  occ_uri,
-            "label":                label,
-            "emergence_quotient":   round(agg_theta * 100),
-            "theta":                round(agg_theta, 4),
-            "confidence":           round(agg_conf, 4),
-            "time_to_emergence":    tte,
-            "dominant_category":    dom_cat,
-            "fuzzy_memberships":    membs,
-            "irt_signals":          {
-                k: {"value": v, "description": IRT_PARAMS.get(k, {}).get("desc", k)}
-                for k, v in final_sigs.items()
-            },
-            "n_associated_skills":  len(assoc_skills),
-            "recommendations":      recs,
+        items.append({
+            "id":          job_id,
+            "title":       ad.get("jobTitle"),
+            "status":      ad.get("status"),
+            "department":  ad.get("departmentName"),
+            "upload_date": detail.get("publishDate"),
+            "occupations": occupation,
+            "skills":      sorted(skill_ids),
         })
+        if idx % 25 == 0 or idx == len(ads):
+            log.info(f"[Hiring] fetched details and skills for {idx}/{len(ads)} jobs")
 
-    occ_results.sort(key=lambda x: x["theta"], reverse=True)
-    occ_results = occ_results[:top_n]
+    return items, skill_labels
 
-    cat_dist: Dict[str, int] = defaultdict(int)
-    for r in occ_results:
-        cat_dist[r["dominant_category"]] += 1
 
-    log.info(f"[LT/Occupations] COMPLETE: {len(occ_results)} occupations — {dict(cat_dist)}")
+# ── 4.2  Organization profile: Employee Management ───────────────
 
-    return {
-        "metadata": {
-            "analysis_type":           "long_term_occupations",
-            "framework":               "EMERGE (IRT 2PL + Fuzzy Logic) — Skill Aggregation",
-            "forecast_horizon_years":  5,
-            "aggregation_method":      "theta-weighted mean of constituent skill scores",
-            "total_records_retrieved": total_docs,
-            "analysis_date":           datetime.now().isoformat(),
-        },
-        "occupations": occ_results,
-        "sector_summary": {
-            "total_occupations_analyzed": len(occ_results),
-            "total_documents_ingested":   total_docs,
-            "documents_by_source":        {src: len(items) for src, items in items_by_source.items()},
-            "category_distribution":      dict(cat_dist),
-            "top_breakthrough":           [r["label"] for r in occ_results if r["dominant_category"] == "breakthrough"][:3],
-            "top_emerging":               [r["label"] for r in occ_results if r["dominant_category"] == "emerging"][:3],
-        },
-    }
+def fetch_org_profile(organization: str) -> Optional[dict]:
+    """Find the organization in Employee Management by name (exact match first, then partial)."""
+    orgs = _portal_get(f"{EMPLOYEE_API}/organizations", organization, required=True) or []
+    target = organization.strip().lower()
+    exact   = [o for o in orgs if (o.get("name") or "").strip().lower() == target]
+    partial = [o for o in orgs if target in (o.get("name") or "").strip().lower()]
+    match = (exact or partial or [None])[0]
+    if match is None:
+        log.warning(f"[Employee] organization '{organization}' not found among {len(orgs)} organizations")
+        return None
+    match = {**match, "sectors": _clean_sectors(match.get("sectors"))}
+    log.info(f"[Employee] '{organization}' → id={match.get('id')}, sectors={match['sectors']}")
+    return match
+
+
+def _clean_sectors(raw: Any) -> List[str]:
+    """
+    Employee Management stores sectors with literal quotes, e.g. '"Computer programming activities"'.
+    Strip quotes and whitespace, drop empties and duplicates, keep order.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    cleaned: List[str] = []
+    for s in raw or []:
+        if s is None:
+            continue
+        name = str(s).strip().strip('"\'').strip()
+        if name and name not in cleaned:
+            cleaned.append(name)
+    return cleaned
+
+
+# ── 4.3  Sector data: SKILLAB Tracker ────────────────────────────
+
+def fetch_sector_jobs(sector: str) -> List[dict]:
+    start, end = _default_dates(TRACKER_YEARS_BACK)
+    body = {"sectors": sector, "min_upload_date": start, "max_upload_date": end}
+    log.info(f"[Tracker] fetching jobs with filters: {body}")
+    return paginate_all(body, endpoint="jobs")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SECTION 4 — ENDPOINTS
+#  SECTION 5 — ORCHESTRATION & ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
 
 def _default_dates(years_back: int = 3) -> Tuple[str, str]:
@@ -1937,557 +1523,173 @@ def _build_cache_key(*parts: Optional[str]) -> str:
     )
 
 
-# ── 4.1  SHORT-TERM SKILLS ────────────────────────────────────────
+# An analysis function takes (items, label_dict, sector_label, data_scope, organization) and returns a result dict
+AnalysisFn = Any
+
+
+def _organization_part(organization: str, profile: Optional[dict], analyze: AnalysisFn) -> Dict:
+    part: Dict[str, Any] = {"data_source": "Hiring Management API (jobAds + interview-skills)"}
+    try:
+        items, skill_labels = fetch_org_jobs(organization)
+        n_undated = sum(1 for it in items if not it["upload_date"])
+        part["jobs_retrieved"] = len(items)
+        part["jobs_without_publish_date"] = n_undated
+        if n_undated:
+            log.warning(f"[Org] {n_undated} job(s) without publishDate are excluded from date-based metrics")
+
+        if not items or len(items) == n_undated:
+            part.update({"status": "no_data",
+                         "message": f"No dated job ads found for organization '{organization}'."})
+            return part
+
+        sector_label = ", ".join(profile.get("sectors") or []) if profile else ""
+        part.update({"status": "ok",
+                     **analyze(items, skill_labels, sector_label or "Unknown", "organization", organization)})
+    except Exception as exc:
+        log.exception(f"[Org] analysis failed for '{organization}'")
+        part.update({"status": "error", "message": str(exc)})
+    return part
+
+
+def _sector_part(organization: str, profile: Optional[dict], analyze: AnalysisFn) -> Dict:
+    part: Dict[str, Any] = {"data_source": "SKILLAB Tracker jobs (sectors from Employee Management)"}
+    if profile is None:
+        part.update({"status": "no_data", "sectors": [],
+                     "message": f"Organization '{organization}' was not found in Employee Management."})
+        return part
+
+    sectors = [s for s in (profile.get("sectors") or []) if s]
+    part["sectors"] = sectors
+    if not sectors:
+        part.update({"status": "no_data",
+                     "message": f"Organization '{organization}' has no sectors in Employee Management."})
+        return part
+
+    _, esco_labels = load_esco_mapping()
+    results_by_sector: Dict[str, Dict] = {}
+    for sector in sectors:
+        try:
+            items = fetch_sector_jobs(sector)
+            if not items:
+                results_by_sector[sector] = {"status": "no_data",
+                                             "message": f"No tracker jobs found for sector '{sector}'."}
+                continue
+            results_by_sector[sector] = {"status": "ok", "jobs_retrieved": len(items),
+                                         **analyze(items, esco_labels, sector, "sector", organization)}
+        except Exception as exc:
+            log.exception(f"[Sector] analysis failed for sector '{sector}'")
+            results_by_sector[sector] = {"status": "error", "message": str(exc)}
+
+    statuses = {r["status"] for r in results_by_sector.values()}
+    part["status"] = "ok" if "ok" in statuses else ("error" if "error" in statuses else "no_data")
+    part["results_by_sector"] = results_by_sector
+    return part
+
+
+def _has_error(output: Dict) -> bool:
+    if output["organization_analysis"].get("status") == "error":
+        return True
+    sec = output["sector_analysis"]
+    return sec.get("status") == "error" or any(
+        r.get("status") == "error" for r in sec.get("results_by_sector", {}).values()
+    )
+
+
+def _run_combined(endpoint: str, organization: str, top_n: int, analyze: AnalysisFn) -> Dict:
+    log.info("=" * 70)
+    log.info(f"[ENDPOINT] {endpoint} — organization={organization}, top_n={top_n}")
+    log.info("=" * 70)
+
+    _ensure_folder()
+    file_path = os.path.join(FOLDER, _build_cache_key(endpoint.strip("/").replace("/", "_"), organization, str(top_n)))
+
+    cached, exists = _load_or_init_cache(file_path)
+    if exists:
+        return cached
+
+    try:
+        try:
+            profile = fetch_org_profile(organization)
+            profile_error = None
+        except Exception as exc:
+            log.exception("[Employee] organization lookup failed")
+            profile, profile_error = None, str(exc)
+
+        output = {
+            "metadata": {
+                "endpoint":      endpoint,
+                "organization":  organization,
+                "analysis_date": datetime.now().isoformat(),
+            },
+            "organization_profile":  profile,
+            "organization_analysis": _organization_part(organization, profile, analyze),
+            "sector_analysis":       _sector_part(organization, profile, analyze),
+        }
+        if profile_error:
+            output["sector_analysis"].update({"status": "error",
+                                              "message": f"Employee Management lookup failed: {profile_error}"})
+
+        if _has_error(output):
+            # Do not cache partial failures, so the next request retries
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        else:
+            _save_cache(file_path, output)
+
+        log.info(f"[ENDPOINT] {endpoint} — DONE")
+        return output
+
+    except Exception:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
+
+
+# ── 5.1  SHORT-TERM SKILLS ────────────────────────────────────────
 
 @app.get("/shorttermanalysis/skills")
 def short_term_skills(
-    organization: Optional[str] = Query(None, description="Organization / company name (display label)."),
-    sector: Optional[str] = Query(None, description="NACE sector code to filter job postings."),
-    top_n: int = Query(50, ge=1, le=200, description="Max entities per sector."),
+    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
 ):
-    log.info("=" * 70)
-    log.info(f"[ENDPOINT] /shorttermanalysis/skills — "
-             f"sector={sector}, organization={organization}")
-    log.info("=" * 70)
-
-    _ensure_folder()
-
-    cache_key = _build_cache_key(
-        "sts_skills", sector, organization
-    )
-    file_path = os.path.join(FOLDER, cache_key)
-
-    cached, exists = _load_or_init_cache(file_path)
-    if exists:
-        return cached
-
-    try:
-        _, label_dict = load_esco_mapping()
-
-        request_body: dict = {}
-        if sector:
-            request_body["sectors"] = sector
-        if organization:
-            request_body["organization_names"] = organization
+    def analyze(items, labels, sector, scope, org):
+        return run_short_term_analysis(items, mode="skills", label_dict=labels, top_n=top_n,
+                                       sector=sector, organization=org)
+    return _run_combined("/shorttermanalysis/skills", organization, top_n, analyze)
 
 
-        log.info(f"[ShortTerm/Skills] fetching jobs with filters: {request_body}")
-        items = paginate_all(request_body, endpoint="jobs")
-        log.info(f"[ShortTerm/Skills] {len(items)} job records retrieved")
-
-        if not items:
-            result = {
-                "status":  "no_data",
-                "message": "No job records found for the given filters.",
-                "result":  [],
-            }
-            _save_cache(file_path, result)
-            return result
-
-        results_by_sector = run_short_term_analysis_by_sector(
-            items, mode="skills", label_dict=label_dict, top_n=top_n,
-            organization=organization or "Unknown",
-            user_sector=sector or "Unknown",  # ← add this
-        )
-
-        output = {
-            "metadata": {
-                "analysis_type":           "short_term_skills_by_sector",
-                "forecast_horizon_years":  3,
-                "historical_window_years": 3,
-                "forecast_model":          "holt_winters_with_linear_fallback",
-                "total_records_retrieved": len(items),
-                "sectors_analyzed":        sorted(results_by_sector.keys()),
-                "analysis_date":           datetime.now().isoformat(),
-            },
-            "filters_applied": {
-                "organization": organization,
-                "sector":       sector
-            },
-            "results_by_sector": results_by_sector,
-        }
-
-        _save_cache(file_path, output)
-        log.info("[ENDPOINT] /shorttermanalysis/skills — DONE")
-        return output
-
-    except Exception as e:
-        _error_cache(file_path, e)
-        raise e
-
-
-# ── 4.2  SHORT-TERM OCCUPATIONS ───────────────────────────────────
+# ── 5.2  SHORT-TERM OCCUPATIONS ───────────────────────────────────
 
 @app.get("/shorttermanalysis/occupations")
 def short_term_occupations(
-    organization: Optional[str] = Query(None, description="Organization name."),
-    sector: Optional[str] = Query(None, description="NACE sector code."),
-    top_n: int = Query(50, ge=1, le=200, description="Max occupations per sector."),
+    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
 ):
-    log.info("=" * 70)
-    log.info(f"[ENDPOINT] /shorttermanalysis/occupations — "
-             f"sector={sector}, organization={organization}")
-    log.info("=" * 70)
-
-    _ensure_folder()
-
-    cache_key = _build_cache_key(
-        "sts_occupations", sector, organization
-    )
-    file_path = os.path.join(FOLDER, cache_key)
-
-    cached, exists = _load_or_init_cache(file_path)
-    if exists:
-        return cached
-
-    try:
-        _, label_dict = load_esco_mapping()
-
-        request_body: dict = {}
-        if sector:
-            request_body["sectors"] = sector
-        if organization:
-            request_body["organization_names"] = organization
-
-        log.info(f"[ShortTerm/Occupations] fetching jobs with filters: {request_body}")
-        items = paginate_all(request_body, endpoint="jobs")
-        log.info(f"[ShortTerm/Occupations] {len(items)} job records retrieved")
-
-        if not items:
-            result = {
-                "status":  "no_data",
-                "message": "No job records found for the given filters.",
-                "result":  [],
-            }
-            _save_cache(file_path, result)
-            return result
-
-        results_by_sector = run_short_term_analysis_by_sector(
-            items, mode="occupations", label_dict=label_dict, top_n=top_n,
-            organization=organization or "Unknown",
-            user_sector=sector or "Unknown",  # ← add this
-        )
-        output = {
-            "metadata": {
-                "analysis_type":           "short_term_occupations_by_sector",
-                "forecast_horizon_years":  3,
-                "historical_window_years": 3,
-                "forecast_model":          "holt_winters_with_linear_fallback",
-                "total_records_retrieved": len(items),
-                "sectors_analyzed":        sorted(results_by_sector.keys()),
-                "analysis_date":           datetime.now().isoformat(),
-            },
-            "filters_applied": {
-                "organization": organization,
-                "sector":       sector
-            },
-            "results_by_sector": results_by_sector,
-        }
-
-        _save_cache(file_path, output)
-        log.info("[ENDPOINT] /shorttermanalysis/occupations — DONE")
-        return output
-
-    except Exception as e:
-        _error_cache(file_path, e)
-        raise e
+    def analyze(items, labels, sector, scope, org):
+        return run_short_term_analysis(items, mode="occupations", label_dict=labels, top_n=top_n,
+                                       sector=sector, organization=org)
+    return _run_combined("/shorttermanalysis/occupations", organization, top_n, analyze)
 
 
-# ── 4.3  LONG-TERM SKILLS ─────────────────────────────────────────
+# ── 5.3  LONG-TERM SKILLS ─────────────────────────────────────────
 
 @app.get("/longtermanalysis/skills")
 def long_term_skills(
-    keywords: Optional[str] = Query(None, description="Comma-separated keywords to filter documents."),
-    keyword_logic: str = Query("or", description="Combine keywords with 'and' or 'or'."),
-    top_n: int = Query(50, ge=1, le=200, description="Max skills in output"),
+    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
 ):
-    log.info("=" * 70)
-    log.info("=" * 70)
-
-    _ensure_folder()
-
-    filename = f"longtermanalysis_skills_{keywords}"
-    file_path = os.path.join(FOLDER, filename)
-
-    cached, exists = _load_or_init_cache(file_path)
-    if exists:
-        return cached
-
-    try:
-        _, label_dict = load_esco_mapping()
-
-        keyword_list = _parse_csv_str(keywords)  # already defined in Section 1
-
-        base = {}
-        if keyword_list:
-            base["keywords"] = keyword_list
-            base["keywords_logic"] = keyword_logic.lower()
-
-        pol_body = {**base}
-        prj_body = {**base}
-
-        policy_items  = paginate_all(pol_body, endpoint="law-policies")
-        project_items = paginate_all(prj_body, endpoint="projects")
-
-        items_by_source = {
-            "policies":    policy_items,
-            "projects":    project_items,
-        }
-        total = sum(len(v) for v in items_by_source.values())
-        log.info(f"[LongTerm/Skills] Total documents: {total} "
-                 f"(policies={len(policy_items)}, projects={len(project_items)}")
-
-        if total == 0:
-            result = {
-                "status":  "no_data",
-                "message": "No policy, project, or white paper records found for the given sector.",
-                "result":  [],
-            }
-            _save_cache(file_path, result)
-            return result
-
-        output = run_long_term_skills(items_by_source, label_dict, top_n=top_n)
-        output["metadata"].update({
-            "keywords": keyword_list,
-            "keyword_logic": keyword_logic,
-        })
-
-        _save_cache(file_path, output)
-        log.info("[ENDPOINT] /longtermanalysis/skills — DONE")
-        return output
-
-    except Exception as e:
-        _error_cache(file_path, e)
-        raise e
+    def analyze(items, labels, sector, scope, org):
+        return run_long_term_skills_from_jobs(items, labels, top_n=top_n, sector=sector, data_scope=scope)
+    return _run_combined("/longtermanalysis/skills", organization, top_n, analyze)
 
 
-# ── 4.4  LONG-TERM OCCUPATIONS ────────────────────────────────────
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SECTION 3 (continued) — LONG-TERM FROM JOBS
-# ══════════════════════════════════════════════════════════════════
-
-JOB_IRT_PARAMS: Dict[str, Dict] = {
-    "posting_density":       {"a": 1.2, "b": 0.25, "desc": "Skill frequency across job postings"},
-    "recency_intensity":     {"a": 2.0, "b": 0.50, "desc": "Share of postings in last 12 months vs all"},
-    "geo_spread":            {"a": 1.3, "b": 0.40, "desc": "Geographic spread of postings"},
-    "cross_sector_adoption": {"a": 1.5, "b": 0.55, "desc": "Sector diversity of postings"},
-    "yoy_growth_rate":       {"a": 1.8, "b": 0.38, "desc": "Year-over-year posting growth rate"},
-    "occupation_breadth":    {"a": 1.1, "b": 0.30, "desc": "Distinct occupations requiring this skill"},
-}
-
-
-def compute_job_signals(
-    entity_uri:        str,
-    job_items:         List[dict],
-    total_job_count:   int,
-) -> Dict[str, float]:
-    docs = [it for it in job_items if entity_uri in it.get("skills", [])]
-    if not docs:
-        return {k: 0.0 for k in JOB_IRT_PARAMS}
-
-    posting_density = min(1.0, len(docs) / max(total_job_count * 0.3, 1))
-
-    recent = [it for it in docs if _is_recent(it.get("upload_date"), years=1)]
-    recency_intensity = min(1.0, len(recent) / len(docs))
-
-    geo_set = set()
-    for it in docs:
-        loc = it.get("country") or it.get("location_code") or ""
-        if loc:
-            geo_set.add(str(loc)[:2].upper())
-    geo_spread = min(1.0, len(geo_set) / 10.0)
-
-    nace_set = set()
-    for it in docs:
-        sectors = it.get("sectors")
-        if isinstance(sectors, list):
-            for s in sectors:
-                if s:
-                    nace_set.add(str(s)[:2].upper())
-        elif sectors:
-            nace_set.add(str(sectors)[:2].upper())
-    cross_sector = min(1.0, len(nace_set) / 5.0)
-
-    yoy = _yoy_growth_signal([it.get("upload_date") for it in docs])
-
-    occ_set = set()
-    for it in docs:
-        occ = it.get("occupation_id") or it.get("occupations")
-        if occ:
-            occ_set.add(str(occ))
-    occ_breadth = min(1.0, len(occ_set) / 10.0)
-
-    return {
-        "posting_density":       round(posting_density,   4),
-        "recency_intensity":     round(recency_intensity, 4),
-        "geo_spread":            round(geo_spread,        4),
-        "cross_sector_adoption": round(cross_sector,      4),
-        "yoy_growth_rate":       round(yoy,               4),
-        "occupation_breadth":    round(occ_breadth,       4),
-    }
-
-
-def run_long_term_skills_from_jobs(
-    job_items:  List[dict],
-    label_dict: Dict[str, str],
-    top_n:      int = 50,
-    sector: str = "Unknown"
-) -> Dict:
-    log.info("[LT/Skills/Jobs] starting long-term skill emergence pipeline from jobs")
-
-    skill_counts: Dict[str, int] = defaultdict(int)
-    for item in job_items:
-        for skill in item.get("skills", []):
-            skill_counts[skill] += 1
-
-    if not skill_counts:
-        log.warning("[LT/Skills/Jobs] no skills found — returning empty result")
-        return {"metadata": {}, "skills": [], "sector_summary": {"total_entities_analyzed": 0}}
-
-    top_skills = sorted(skill_counts, key=skill_counts.get, reverse=True)[:top_n]
-    log.info(f"[LT/Skills/Jobs] {len(skill_counts)} unique skills, analyzing top {len(top_skills)}")
-
-    results = []
-    for idx, uri in enumerate(top_skills, 1):
-        if idx % 10 == 0 or idx == len(top_skills):
-            log.info(f"  ...EMERGE/Jobs progress: {idx}/{len(top_skills)}")
-
-        signals     = compute_job_signals(uri, job_items, len(job_items))
-        theta, conf = estimate_theta(signals)
-        membs       = fuzzy_memberships(theta)
-        dom_cat     = dominant_category(membs)
-        tte         = time_to_emergence(theta, conf)
-        label       = label_dict.get(uri, uri)
-        recs        = _long_term_recommendations(dom_cat, label, theta, tte, signals)
-
-        results.append({
-            "uri":                   uri,
-            "label":                 label,
-            "emergence_quotient":    round(theta * 100),
-            "theta":                 theta,
-            "confidence":            conf,
-            "time_to_emergence":     tte,
-            "dominant_category":     dom_cat,
-            "fuzzy_memberships":     membs,
-            "irt_signals":           {
-                k: {"value": v, "description": JOB_IRT_PARAMS[k]["desc"]}
-                for k, v in signals.items()
-            },
-            "total_job_mentions":    skill_counts.get(uri, 0),
-            "recommendations":       recs,
-        })
-
-    results.sort(key=lambda x: x["theta"], reverse=True)
-
-    cat_dist: Dict[str, int] = defaultdict(int)
-    for r in results:
-        cat_dist[r["dominant_category"]] += 1
-
-    log.info(f"[LT/Skills/Jobs] COMPLETE: {len(results)} skills — {dict(cat_dist)}")
-
-    return {
-        "metadata": {
-            "analysis_type":           "long_term_skills_from_jobs",
-            "framework":               "EMERGE (IRT 2PL + Trapezoidal Fuzzy Logic)",
-            "forecast_horizon_years":  5,
-            "n_irt_signals":           len(JOB_IRT_PARAMS),
-            "fuzzy_sets":              list(FUZZY_SETS.keys()),
-            "total_records_retrieved": len(job_items),
-            "analysis_date":           datetime.now().isoformat(),
-        },
-        "skills": results,
-        "sector_summary": {
-            "total_entities_analyzed":  len(results),
-            "total_jobs_ingested":      len(job_items),
-            "category_distribution":    dict(cat_dist),
-            "top_breakthrough":         [r["label"] for r in results if r["dominant_category"] == "breakthrough"][:3],
-            "top_emerging":             [r["label"] for r in results if r["dominant_category"] == "emerging"][:3],
-            "top_speculative":          [r["label"] for r in results if r["dominant_category"] == "speculative"][:3],
-        },
-    }
-
-
-def run_long_term_occupations_from_jobs(
-    job_items:  List[dict],
-    label_dict: Dict[str, str],
-    top_n:      int = 50,
-    sector: str = "Unknown"
-) -> Dict:
-    log.info("[LT/Occupations/Jobs] starting long-term occupation emergence pipeline from jobs")
-    total_jobs = len(job_items)
-
-    # Step 1: compute skill-level thetas from jobs
-    log.info("[LT/Occupations/Jobs] Step 1: computing skill thetas from jobs...")
-    skills_output = run_long_term_skills_from_jobs(job_items, label_dict, top_n=500)
-    skill_theta_map: Dict[str, Tuple[float, float]] = {
-        s["uri"]: (s["theta"], s["confidence"])
-        for s in skills_output.get("skills", [])
-    }
-    log.info(f"[LT/Occupations/Jobs] Step 1 done: {len(skill_theta_map)} skill thetas computed")
-
-    if not skill_theta_map:
-        log.warning("[LT/Occupations/Jobs] no skill thetas — returning empty result")
-        return {"metadata": {}, "occupations": [], "sector_summary": {"total_occupations_analyzed": 0}}
-
-    # Step 2: build occupation→skill map directly from job co-occurrence
-    log.info("[LT/Occupations/Jobs] Step 2: building occupation→skill map from jobs...")
-    occ_skills_map: Dict[str, List[str]] = defaultdict(list)
-    for item in job_items:
-        occ = item.get("occupation_id") or item.get("occupations")
-        if occ:
-            for skill in item.get("skills", []):
-                occ_skills_map[str(occ)].append(skill)
-
-    if not occ_skills_map:
-        log.warning("[LT/Occupations/Jobs] no occupation-skill mapping found — returning empty result")
-        return {
-            "metadata":       {},
-            "occupations":    [],
-            "sector_summary": {"total_occupations_analyzed": 0, "reason": "No occupation-skill mapping found."},
-        }
-
-    # Step 3: aggregate skill thetas to occupation level
-    log.info(f"[LT/Occupations/Jobs] Step 3: aggregating across {len(occ_skills_map)} occupations...")
-    occ_results = []
-    for idx, (occ_uri, assoc_skills) in enumerate(occ_skills_map.items(), 1):
-        if idx % 25 == 0:
-            log.info(f"  ...aggregation progress: {idx}/{len(occ_skills_map)}")
-
-        theta_conf_pairs = [
-            skill_theta_map[s] for s in assoc_skills if s in skill_theta_map
-        ]
-        if not theta_conf_pairs:
-            continue
-
-        thetas    = [tc[0] for tc in theta_conf_pairs]
-        confs     = [tc[1] for tc in theta_conf_pairs]
-        weights   = np.array(thetas) + 0.01
-        agg_theta = float(np.average(thetas, weights=weights))
-        agg_conf  = float(np.mean(confs))
-
-        membs   = fuzzy_memberships(agg_theta)
-        dom_cat = dominant_category(membs)
-        tte     = time_to_emergence(agg_theta, agg_conf)
-        label   = label_dict.get(occ_uri, occ_uri)
-
-        # aggregate job signals across constituent skills
-        agg_sigs: Dict[str, List[float]] = defaultdict(list)
-        for s_uri in assoc_skills:
-            if s_uri in skill_theta_map:
-                s_signals = compute_job_signals(s_uri, job_items, total_jobs)
-                for k, v in s_signals.items():
-                    agg_sigs[k].append(v)
-        final_sigs = {k: round(float(np.mean(v)), 4) for k, v in agg_sigs.items()}
-
-        recs = _long_term_job_recommendations(
-            dom_cat, label, agg_theta, tte, final_sigs,
-            sector=sector,
-            entity_type="occupation",
-        )
-
-        occ_results.append({
-            "uri":                  occ_uri,
-            "label":                label,
-            "emergence_quotient":   round(agg_theta * 100),
-            "theta":                round(agg_theta, 4),
-            "confidence":           round(agg_conf, 4),
-            "time_to_emergence":    tte,
-            "dominant_category":    dom_cat,
-            "fuzzy_memberships":    membs,
-            "irt_signals":          {
-                k: {"value": v, "description": JOB_IRT_PARAMS.get(k, {}).get("desc", k)}
-                for k, v in final_sigs.items()
-            },
-            "n_associated_skills":  len(assoc_skills),
-            "recommendations":      recs,
-        })
-
-    occ_results.sort(key=lambda x: x["theta"], reverse=True)
-    occ_results = occ_results[:top_n]
-
-    cat_dist: Dict[str, int] = defaultdict(int)
-    for r in occ_results:
-        cat_dist[r["dominant_category"]] += 1
-
-    log.info(f"[LT/Occupations/Jobs] COMPLETE: {len(occ_results)} occupations — {dict(cat_dist)}")
-
-    return {
-        "metadata": {
-            "analysis_type":           "long_term_occupations_from_jobs",
-            "framework":               "EMERGE (IRT 2PL + Fuzzy Logic) — Job-based Skill Aggregation",
-            "forecast_horizon_years":  5,
-            "aggregation_method":      "theta-weighted mean of constituent skill scores",
-            "total_records_retrieved": total_jobs,
-            "analysis_date":           datetime.now().isoformat(),
-        },
-        "occupations": occ_results,
-        "sector_summary": {
-            "total_occupations_analyzed": len(occ_results),
-            "total_jobs_ingested":        total_jobs,
-            "category_distribution":      dict(cat_dist),
-            "top_breakthrough":           [r["label"] for r in occ_results if r["dominant_category"] == "breakthrough"][:3],
-            "top_emerging":               [r["label"] for r in occ_results if r["dominant_category"] == "emerging"][:3],
-        },
-    }
-
-
-# ── 4.4  LONG-TERM OCCUPATIONS (from jobs) ───────────────────────
+# ── 5.4  LONG-TERM OCCUPATIONS ────────────────────────────────────
 
 @app.get("/longtermanalysis/occupations")
 def long_term_occupations(
-    sector:       Optional[str] = Query(None, description="NACE sector code to filter job postings."),
-    organization: Optional[str] = Query(None, description="Organization name to filter job postings."),
-    top_n:        int           = Query(50, ge=1, le=200, description="Max occupations in output."),
+    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
 ):
-    log.info("=" * 70)
-    log.info(f"[ENDPOINT] /longtermanalysis/occupations — sector={sector}, organization={organization}")
-    log.info("=" * 70)
-
-    _ensure_folder()
-
-    cache_key = _build_cache_key("lt_occupations", sector, organization)
-    file_path = os.path.join(FOLDER, cache_key)
-
-    cached, exists = _load_or_init_cache(file_path)
-    if exists:
-        return cached
-
-    try:
-        _, label_dict = load_esco_mapping()
-
-        request_body: dict = {}
-        if sector:
-            request_body["sectors"] = sector
-        if organization:
-            request_body["organization_names"] = organization
-
-        log.info(f"[LongTerm/Occupations] fetching jobs with filters: {request_body}")
-        job_items = paginate_all(request_body, endpoint="jobs")
-        log.info(f"[LongTerm/Occupations] {len(job_items)} job records retrieved")
-
-        if not job_items:
-            result = {
-                "status":  "no_data",
-                "message": "No job records found for the given filters.",
-                "result":  [],
-            }
-            _save_cache(file_path, result)
-            return result
-
-        output = run_long_term_occupations_from_jobs(job_items, label_dict, top_n=top_n, sector=sector or "Unknown")
-        output["metadata"].update({
-            "filters_applied": {
-                "sector":       sector,
-                "organization": organization,
-            }
-        })
-
-        _save_cache(file_path, output)
-        log.info("[ENDPOINT] /longtermanalysis/occupations — DONE")
-        return output
-
-    except Exception as e:
-        _error_cache(file_path, e)
-        raise e
+    def analyze(items, labels, sector, scope, org):
+        return run_long_term_occupations_from_jobs(items, labels, top_n=top_n, sector=sector, data_scope=scope)
+    return _run_combined("/longtermanalysis/occupations", organization, top_n, analyze)

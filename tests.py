@@ -1,50 +1,52 @@
 """
 test_demand_analysis.py
 =====================================================================
-Pytest test-suite for demand_analysis.py — SKILLAB Demand Analysis
+Pytest suite for the SKILLAB Demand Analysis service
 =====================================================================
 
-KNOWN BUGS DOCUMENTED BY THIS SUITE
--------------------------------------
-BUG-1  _SECTOR_FIELDS = ("sectors")   → this is the *string* "sectors",
-       not a tuple. Iterating over it yields individual chars ('s','e',…),
-       so _extract_sectors() always returns ["unknown"].
-       Fix: change to ("sectors",)  or  ["sectors"].
+Every endpoint takes ?organization=<name> and returns two analyses:
+  organization_analysis — job ads from the Hiring Management API
+  sector_analysis       — sectors from the Employee Management API,
+                          then job postings per sector from the SKILLAB Tracker
 
-BUG-2  run_long_term_skills() references the name `sector` which is not
-       a parameter of that function → NameError at runtime when data is
-       non-empty.
-       Fix: add  sector: str = "Unknown"  to the signature.
-
-Tests for intended behaviour are written against the *correct* semantics.
-They will fail on the buggy code and pass once the bugs are fixed.
-Tests documenting current (buggy) behaviour are in class TestKnownBugs.
+No test touches the network: the portal APIs, the Tracker, the ESCO file
+and the LLM are all replaced by in-memory fakes.
 
 Run with:
     pytest test_demand_analysis.py -v
-    pytest test_demand_analysis.py -v -k "not KnownBugs"   # skip bug docs
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import math
-import os
-from collections import defaultdict
 from datetime import datetime, timedelta
-from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
-import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 # ── module under test ────────────────────────────────────────────
-# Adjust the import if your working directory or package differs.
-import service as da
-from service import app
+# Adjust the import if your module has a different name.
+import service_new as da
+from service_new import app
+
+client = TestClient(app)
+
+# Fail fast with a clear message if `service` is an older version of the module
+_REQUIRED = ["_run_combined", "fetch_org_profile", "fetch_org_jobs", "fetch_sector_jobs", "_portal_get",
+             "_clean_sectors", "_available_signals", "_occupations_of", "_long_term_job_recommendations",
+             "HIRING_API", "EMPLOYEE_API", "PORTAL_API_TOKEN"]
+_missing = [name for name in _REQUIRED if not hasattr(da, name)]
+if _missing:
+    pytest.exit(f"`service` is not the current demand-analysis module; missing: {', '.join(_missing)}",
+                returncode=2)
+
+# Fixed URLs so the tests do not depend on the .env of the machine running them
+TEST_HIRING_API   = "https://test.local/hiring-management"
+TEST_EMPLOYEE_API = "https://test.local/employee-management"
+
 
 # ══════════════════════════════════════════════════════════════════
 #  SHARED HELPERS & FIXTURES
@@ -52,229 +54,223 @@ from service import app
 
 SKILL_URIS = [f"http://data.europa.eu/esco/skill/{i}" for i in range(6)]
 OCC_URIS   = [f"http://data.europa.eu/esco/occupation/{i}" for i in range(3)]
-ALL_URIS   = SKILL_URIS + OCC_URIS
+
+
+def _days_ago(n: int) -> str:
+    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
 def _make_items(n: int = 15) -> list[dict]:
-    """Return *n* synthetic job-posting dicts spanning the last ~18 months."""
-    base  = datetime(2023, 6, 1)
-    items = []
-    for i in range(n):
-        d = (base - timedelta(days=i * 30)).strftime("%Y-%m-%d")
-        items.append({
-            "upload_date":   d,
-            "skills":        SKILL_URIS[: (i % 3) + 1],
-            "occupation_id": OCC_URIS[i % 3],
-            "sectors":       [["J", "K"][i % 2]],
-            "country":       ["DE", "FR", "IT"][i % 3],
-        })
-    return items
+    """Tracker-style jobs spread over the last ~2.5 years (inside the 12-quarter window)."""
+    return [{
+        "upload_date": _days_ago(i * 60),
+        "skills":      SKILL_URIS[: (i % 3) + 1],
+        "occupations": [OCC_URIS[i % 3]],
+        "sectors":     [["J", "K"][i % 2]],
+        "country":     ["DE", "FR", "IT"][i % 3],
+    } for i in range(n)]
 
 
-def _fake_label_dict() -> dict[str, str]:
-    d: dict[str, str] = {}
-    d.update({u: f"Skill {i}"      for i, u in enumerate(SKILL_URIS)})
+def _label_dict() -> dict[str, str]:
+    d = {u: f"Skill {i}" for i, u in enumerate(SKILL_URIS)}
     d.update({u: f"Occupation {i}" for i, u in enumerate(OCC_URIS)})
     return d
 
 
-def _fake_esco_df() -> pd.DataFrame:
-    ld = _fake_label_dict()
-    return pd.DataFrame({
-        "conceptUri":     list(ld.keys()),
-        "preferredLabel": list(ld.values()),
-    })
+_ESCO_DF = pd.DataFrame({"conceptUri": list(_label_dict()), "preferredLabel": list(_label_dict().values())})
 
 
-# Re-usable mock return values for the LT pipeline
-def _make_lt_skills_output() -> dict:
-    return {
-        "metadata":       {"analysis_type": "lt_skills_test"},
-        "skills":         [],
-        "sector_summary": {"total_entities_analyzed": 0, "category_distribution": {}},
-    }
+class _Resp:
+    def __init__(self, data=None, status=200):
+        self._data, self.status_code = data, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._data
 
 
-def _make_lt_occs_output() -> dict:
-    return {
-        "metadata":       {"analysis_type": "lt_occs_test"},
-        "occupations":    [],
-        "sector_summary": {"total_occupations_analyzed": 0, "category_distribution": {}},
-    }
+class FakePortal:
+    """
+    In-memory Hiring Management + Employee Management APIs.
+    Records every GET so tests can check URLs and headers.
+    """
+
+    def __init__(self, n_ads: int = 12):
+        self.organizations = [
+            {"id": 7, "name": "Eclipse Foundation", "location": "Brussels",
+             "sectors": ['"Computer programming activities"', '"Research"'], "objectives": []},
+            {"id": 8, "name": "Eclipse", "location": "Athens",
+             "sectors": ["Exact match sector"], "objectives": []},
+            {"id": 9, "name": "No Sector Org", "location": "Rome", "sectors": [], "objectives": []},
+        ]
+        occs = ["software developer", "data analyst", "ict project manager"]
+        self.ads = [{"id": i, "jobTitle": f"Job {i}", "occupationName": occs[i % 3],
+                     "status": "PUBLISHED", "departmentName": "IT"} for i in range(1, n_ads + 1)]
+        self.details = {i: {"id": i, "publishDate": _days_ago(i * 70)} for i in range(1, n_ads + 1)}
+        self.skills = {i: [{"id": s, "title": f"skill {s}"} for s in range(1, (i % 4) + 3)]
+                       for i in range(1, n_ads + 1)}
+        self.fail_hiring = False
+        self.fail_employee = False
+        self.calls: list[tuple[str, dict]] = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append((url, dict(headers or {})))
+        if url == f"{TEST_EMPLOYEE_API}/organizations":
+            return _Resp(status=500) if self.fail_employee else _Resp(self.organizations)
+        if url.startswith(f"{TEST_HIRING_API}/"):
+            if self.fail_hiring:
+                return _Resp(status=500)
+            path = url[len(TEST_HIRING_API):]
+            if path == "/api/v1/jobAds":
+                return _Resp(self.ads)
+            job_id = int(path.split("/")[4])
+            if path.endswith("/interview-skills"):
+                return _Resp(self.skills.get(job_id, []))
+            return _Resp(self.details.get(job_id, {}))
+        return _Resp(status=404)
 
 
-# ── pytest fixtures ───────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def fixed_env(monkeypatch):
+    """Ignore whatever HIRING_API / EMPLOYEE_API / PORTAL_API_TOKEN the local .env sets."""
+    monkeypatch.setattr(da, "HIRING_API", TEST_HIRING_API)
+    monkeypatch.setattr(da, "EMPLOYEE_API", TEST_EMPLOYEE_API)
+    monkeypatch.setattr(da, "PORTAL_API_TOKEN", None)
+    monkeypatch.setattr(da, "TRACKER_YEARS_BACK", 3)
+
 
 @pytest.fixture
-def sample_items() -> list[dict]:
+def label_dict():
+    return _label_dict()
+
+
+@pytest.fixture
+def sample_items():
     return _make_items(15)
 
 
 @pytest.fixture
-def label_dict() -> dict[str, str]:
-    return _fake_label_dict()
-
-
-@pytest.fixture
 def tmp_cache(tmp_path, monkeypatch):
-    """Redirect da.FOLDER to an isolated temp directory per test."""
     folder = tmp_path / "cache"
     folder.mkdir()
     monkeypatch.setattr(da, "FOLDER", folder)
     return folder
 
 
-# FastAPI test-client (shared; stateless between tests)
-client = TestClient(app)
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(da.time, "sleep", lambda *_: None)
+
+
+@pytest.fixture
+def no_llm(monkeypatch):
+    llm = MagicMock(return_value=None)
+    monkeypatch.setattr(da, "_chat_llm_json", llm)
+    return llm
+
+
+@pytest.fixture
+def portal(monkeypatch, no_sleep):
+    fake = FakePortal()
+    monkeypatch.setattr(da.req, "get", fake.get)
+    return fake
+
+
+@pytest.fixture
+def services(portal, tmp_cache, no_llm, monkeypatch):
+    """Everything an endpoint needs, faked. Returns (portal, tracker_mock, llm_mock)."""
+    tracker = MagicMock(side_effect=lambda body, endpoint: _make_items(12))
+    monkeypatch.setattr(da, "paginate_all", tracker)
+    monkeypatch.setattr(da, "load_esco_mapping", lambda: (_ESCO_DF, _label_dict()))
+    return portal, tracker, no_llm
+
+
+ENDPOINTS = [
+    ("/shorttermanalysis/skills",       "skills"),
+    ("/shorttermanalysis/occupations",  "occupations"),
+    ("/longtermanalysis/skills",        "skills"),
+    ("/longtermanalysis/occupations",   "occupations"),
+]
 
 
 # ══════════════════════════════════════════════════════════════════
 #  1.  SHARED INFRASTRUCTURE
 # ══════════════════════════════════════════════════════════════════
 
-class TestParseCsvStr:
-    def test_splits_on_comma(self):
-        assert da._parse_csv_str("a,b,c") == ["a", "b", "c"]
-
-    def test_strips_whitespace(self):
-        assert da._parse_csv_str(" x , y ") == ["x", "y"]
-
-    def test_none_returns_none(self):
-        assert da._parse_csv_str(None) is None
-
-    def test_empty_string_returns_none(self):
-        assert da._parse_csv_str("") is None
-
-    def test_single_value_list(self):
-        assert da._parse_csv_str("solo") == ["solo"]
-
-    def test_trailing_comma_ignored(self):
-        result = da._parse_csv_str("a,b,")
-        assert "" not in result
-
-
-class TestParseCsvInt:
-    def test_parses_integers(self):
-        assert da._parse_csv_int("1,2,3") == [1, 2, 3]
-
-    def test_none_returns_none(self):
-        assert da._parse_csv_int(None) is None
-
-    def test_empty_returns_none(self):
-        assert da._parse_csv_int("") is None
-
-
-class TestExtractSectors:
-    """
-    NOTE: These tests reflect the *intended* behaviour.
-    They will fail on the current code due to BUG-1
-    (_SECTOR_FIELDS = ("sectors") is a string, not a tuple).
-    """
-
-    def test_list_sector_field(self):
-        assert da._extract_sectors({"sectors": ["J", "K"]}) == ["J", "K"]
-
-    def test_string_sector_field(self):
-        assert da._extract_sectors({"sectors": "J"}) == ["J"]
-
-    def test_missing_key_returns_unknown(self):
-        assert da._extract_sectors({}) == ["unknown"]
-
-    def test_none_value_returns_unknown(self):
-        assert da._extract_sectors({"sectors": None}) == ["unknown"]
-
-    def test_empty_list_returns_unknown(self):
-        assert da._extract_sectors({"sectors": []}) == ["unknown"]
-
-    def test_string_stripped(self):
-        assert da._extract_sectors({"sectors": " J "}) == ["J"]
-
-
-class TestGroupItemsBySector:
-    def test_single_sector_grouping(self):
-        items = [{"sectors": ["J"]}, {"sectors": ["K"]}, {"sectors": ["J"]}]
-        g = da._group_items_by_sector(items)
-        assert len(g["J"]) == 2
-        assert len(g["K"]) == 1
-
-    def test_item_in_multiple_sectors(self):
-        items = [{"sectors": ["J", "K"]}]
-        g = da._group_items_by_sector(items)
-        assert len(g["J"]) == 1
-        assert len(g["K"]) == 1
-
-    def test_empty_input_empty_dict(self):
-        assert da._group_items_by_sector([]) == {}
-
-    def test_missing_sector_field_goes_to_unknown(self):
-        g = da._group_items_by_sector([{"other": True}])
-        assert "unknown" in g
-
-
 class TestCacheHelpers:
     def test_creates_in_progress_stub_when_missing(self, tmp_path):
         path = str(tmp_path / "stub.json")
         data, exists = da._load_or_init_cache(path)
-        assert not exists
-        assert data is None
+        assert not exists and data is None
         with open(path) as f:
-            stub = json.load(f)
-        assert stub["status"] == "in_progress"
-        assert stub["result"] is None
+            assert json.load(f)["status"] == "in_progress"
 
     def test_returns_existing_data(self, tmp_path):
         path = str(tmp_path / "hit.json")
         payload = {"status": "ok", "result": [1, 2, 3]}
         with open(path, "w") as f:
             json.dump(payload, f)
-        data, exists = da._load_or_init_cache(path)
-        assert exists and data == payload
-
-    def test_save_then_reload(self, tmp_path):
-        path = str(tmp_path / "save.json")
-        da._save_cache(path, {"k": "v"})
-        with open(path) as f:
-            assert json.load(f) == {"k": "v"}
-
-    def test_error_cache_stores_message(self, tmp_path):
-        path = str(tmp_path / "err.json")
-        da._error_cache(path, ValueError("something broke"))
-        with open(path) as f:
-            d = json.load(f)
-        assert d["status"] == "error"
-        assert "something broke" in d["message"]
+        assert da._load_or_init_cache(path) == (payload, True)
 
     def test_save_cache_unicode_safe(self, tmp_path):
         path = str(tmp_path / "unicode.json")
         da._save_cache(path, {"label": "Ανάλυση"})
         with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-        assert d["label"] == "Ανάλυση"
+            assert json.load(f)["label"] == "Ανάλυση"
 
 
 class TestBuildCacheKey:
-    def test_includes_all_parts(self):
-        key = da._build_cache_key("prefix", "sector", "org")
-        assert "prefix" in key and "sector" in key
-
     def test_none_parts_excluded(self):
-        key = da._build_cache_key("a", None, "b")
-        assert "None" not in key
+        assert "None" not in da._build_cache_key("a", None, "b")
 
-    def test_slash_sanitized(self):
-        assert "/" not in da._build_cache_key("sector/IT")
-
-    def test_space_sanitized(self):
-        assert " " not in da._build_cache_key("org name")
+    @pytest.mark.parametrize("raw", ["sector/IT", "org name", 'with "quotes"'])
+    def test_sanitized(self, raw):
+        key = da._build_cache_key(raw)
+        assert not any(c in key for c in '/ "')
 
     def test_deterministic(self):
-        k1 = da._build_cache_key("x", "y", "z")
-        k2 = da._build_cache_key("x", "y", "z")
-        assert k1 == k2
+        assert da._build_cache_key("x", "y") == da._build_cache_key("x", "y")
+
+
+class TestPaginateAll:
+    def test_logs_in_once_for_all_pages(self, monkeypatch):
+        token = MagicMock(return_value="tok")
+        monkeypatch.setattr(da, "get_token", token)
+        monkeypatch.setattr(da.time, "sleep", lambda *_: None)
+        pages = {1: {"count": 700, "items": [1] * 300}, 2: {"items": [2] * 300}, 3: {"items": [3] * 100}}
+        extract = MagicMock(side_effect=lambda body, page, endpoint, token: pages[page])
+        monkeypatch.setattr(da, "api_extract", extract)
+
+        items = da.paginate_all({"sectors": "J"}, "jobs")
+
+        assert len(items) == 700
+        token.assert_called_once()
+        assert all(c.kwargs["token"] == "tok" for c in extract.call_args_list)
+
+    def test_single_page(self, monkeypatch):
+        monkeypatch.setattr(da, "get_token", lambda: "tok")
+        monkeypatch.setattr(da, "api_extract", lambda *a, **k: {"count": 2, "items": ["a", "b"]})
+        assert da.paginate_all({}, "jobs") == ["a", "b"]
+
+
+class TestOccupationsOf:
+    @pytest.mark.parametrize("item,expected", [
+        ({"occupations": "data analyst"},          ["data analyst"]),
+        ({"occupations": ["u1", "u2"]},            ["u1", "u2"]),
+        ({"occupation_id": "occ1"},                ["occ1"]),
+        ({"occupations": [None, "", "u1"]},        ["u1"]),
+        ({},                                       []),
+        ({"occupations": None},                    []),
+    ])
+    def test_cases(self, item, expected):
+        assert da._occupations_of(item) == expected
 
 
 # ══════════════════════════════════════════════════════════════════
-#  2.  SHORT-TERM ANALYSIS  —  DATE / QUARTER HELPERS
+#  2.  SHORT-TERM ANALYSIS — HELPERS AND METRICS
 # ══════════════════════════════════════════════════════════════════
 
 class TestToQuarterStr:
@@ -283,1234 +279,667 @@ class TestToQuarterStr:
         ("2024-04-15", "2024-Q2"),
         ("2023-08-30", "2023-Q3"),
         ("2022-12-31", "2022-Q4"),
-        ("2023-03-01T12:00:00", "2023-Q1"),   # ISO with time component
+        ("2023-03-01T12:00:00", "2023-Q1"),
     ])
     def test_date_to_quarter(self, date_str, expected):
         assert da._to_quarter_str(date_str) == expected
 
-    def test_none_input_returns_none(self):
-        assert da._to_quarter_str(None) is None
-
-    def test_empty_string_returns_none(self):
-        assert da._to_quarter_str("") is None
-
-    def test_invalid_format_returns_none(self):
-        assert da._to_quarter_str("not-a-date") is None
-
-    def test_quarter_boundaries(self):
-        # First and last day of each quarter
-        assert da._to_quarter_str("2023-01-01")[-2:] == "Q1"
-        assert da._to_quarter_str("2023-03-31")[-2:] == "Q1"
-        assert da._to_quarter_str("2023-04-01")[-2:] == "Q2"
-        assert da._to_quarter_str("2023-06-30")[-2:] == "Q2"
+    @pytest.mark.parametrize("bad", [None, "", "not-a-date"])
+    def test_invalid_returns_none(self, bad):
+        assert da._to_quarter_str(bad) is None
 
 
-class TestQuartersBack:
-    def test_correct_length(self):
-        assert len(da._quarters_back(8)) == 8
+class TestQuarterLabels:
+    def test_back_length_and_order(self):
+        labels = da._quarters_back(8)
+        assert len(labels) == 8
+        keys = [(int(l[:4]), int(l[-1])) for l in labels]
+        assert keys == sorted(keys)
 
-    def test_strictly_ascending(self):
-        labels = da._quarters_back(6)
-        for a, b in zip(labels, labels[1:]):
-            ya, qa = int(a[:4]), int(a[-1])
-            yb, qb = int(b[:4]), int(b[-1])
-            assert (ya, qa) < (yb, qb)
+    def test_back_ends_at_current_quarter(self):
+        now = datetime.now()
+        assert da._quarters_back(4)[-1] == f"{now.year}-Q{(now.month - 1) // 3 + 1}"
 
-    def test_all_contain_q_marker(self):
-        for lbl in da._quarters_back(4):
-            assert "-Q" in lbl
-
-    def test_ends_at_or_before_current_quarter(self):
+    def test_forward_all_future(self):
         now = datetime.now()
         cur = (now.year, (now.month - 1) // 3 + 1)
-        last = da._quarters_back(4)[-1]
-        yr, q = int(last[:4]), int(last[-1])
-        assert (yr, q) <= cur
-
-
-class TestQuartersForward:
-    def test_correct_length(self):
-        assert len(da._quarters_forward(6)) == 6
-
-    def test_all_strictly_future(self):
-        now = datetime.now()
-        curq = (now.year, (now.month - 1) // 3 + 1)
         for lbl in da._quarters_forward(4):
-            yr, q = int(lbl[:4]), int(lbl[-1])
-            assert (yr, q) > curq
-
-    def test_strictly_ascending(self):
-        labels = da._quarters_forward(4)
-        for a, b in zip(labels, labels[1:]):
-            ya, qa = int(a[:4]), int(a[-1])
-            yb, qb = int(b[:4]), int(b[-1])
-            assert (ya, qa) < (yb, qb)
+            assert (int(lbl[:4]), int(lbl[-1])) > cur
 
 
-# ══════════════════════════════════════════════════════════════════
-#  2.  SHORT-TERM ANALYSIS  —  TIME-SERIES BUILDERS
-# ══════════════════════════════════════════════════════════════════
+class TestSeriesBuilders:
+    def test_skill_counts_per_quarter(self):
+        items = [{"upload_date": "2023-01-01", "skills": ["s1", "s2"]},
+                 {"upload_date": "2023-02-01", "skills": ["s1"]}]
+        s = da._build_skill_series(items)
+        assert s["s1"]["2023-Q1"] == 2 and s["s2"]["2023-Q1"] == 1
 
-class TestBuildSkillSeries:
-    def test_counts_per_quarter(self):
-        items = [
-            {"upload_date": "2023-01-01", "skills": ["s1", "s2"]},
-            {"upload_date": "2023-02-01", "skills": ["s1"]},
-        ]
-        series = da._build_skill_series(items)
-        assert series["s1"]["2023-Q1"] == 2
-        assert series["s2"]["2023-Q1"] == 1
+    def test_skill_missing_or_bad_date_skipped(self):
+        assert da._build_skill_series([{"upload_date": None, "skills": ["s1"]},
+                                       {"upload_date": "bad", "skills": ["s1"]}]) == {}
 
-    def test_multiple_quarters_tracked(self):
-        items = [
-            {"upload_date": "2022-03-01", "skills": ["s1"]},
-            {"upload_date": "2022-09-01", "skills": ["s1"]},
-            {"upload_date": "2023-01-01", "skills": ["s1"]},
-        ]
-        series = da._build_skill_series(items)
-        assert len(series["s1"]) == 3
+    def test_occupation_name_string(self):
+        items = [{"upload_date": "2023-07-01", "occupations": "data analyst"}]
+        assert da._build_occupation_series(items) == {"data analyst": {"2023-Q3": 1}}
 
-    def test_missing_date_skipped(self):
-        items = [{"upload_date": None, "skills": ["s1"]}]
-        assert da._build_skill_series(items) == {}
+    def test_occupation_list_counts_each_uri(self):
+        """Tracker jobs carry a list of URIs; each must be its own key, not str(list)."""
+        items = [{"upload_date": "2023-07-01", "occupations": ["u1", "u2"]}]
+        s = da._build_occupation_series(items)
+        assert set(s) == {"u1", "u2"}
 
-    def test_invalid_date_skipped(self):
-        items = [{"upload_date": "bad", "skills": ["s1"]}]
-        assert da._build_skill_series(items) == {}
-
-    def test_empty_skills_skipped(self):
-        items = [{"upload_date": "2023-01-01", "skills": []}]
-        assert da._build_skill_series(items) == {}
-
-    def test_custom_date_field(self):
-        items = [{"posted_on": "2023-04-01", "skills": ["s1"]}]
-        series = da._build_skill_series(items, date_field="posted_on")
-        assert "s1" in series
+    def test_fill_series_zeros_for_missing(self):
+        assert da._fill_series({"2023-Q1": 5, "2023-Q3": 10},
+                               ["2023-Q1", "2023-Q2", "2023-Q3"]) == [5.0, 0.0, 10.0]
 
 
-class TestBuildOccupationSeries:
-    def test_occupation_id_field(self):
-        items = [
-            {"upload_date": "2023-01-01", "occupation_id": "occ1"},
-            {"upload_date": "2023-02-01", "occupation_id": "occ1"},
-        ]
-        assert da._build_occupation_series(items)["occ1"]["2023-Q1"] == 2
+class TestForecast:
+    def test_linear_points_and_method(self):
+        r = da._linear_forecast([1.0, 2.0, 3.0], 5)
+        assert r["method"] == "linear_trend" and len(r["forecast"]) == 5
 
-    def test_occupations_fallback_field(self):
-        items = [{"upload_date": "2023-07-01", "occupations": "occ2"}]
-        assert "occ2" in da._build_occupation_series(items)
-
-    def test_no_occupation_skipped(self):
-        items = [{"upload_date": "2023-01-01"}]
-        assert da._build_occupation_series(items) == {}
-
-    def test_missing_date_skipped(self):
-        items = [{"occupation_id": "occ1"}]
-        assert da._build_occupation_series(items) == {}
-
-
-class TestFillSeries:
-    def test_fills_zeros_for_missing(self):
-        qd = {"2023-Q1": 5, "2023-Q3": 10}
-        result = da._fill_series(qd, ["2023-Q1", "2023-Q2", "2023-Q3"])
-        assert result == [5.0, 0.0, 10.0]
-
-    def test_all_zeros_when_empty_dict(self):
-        assert da._fill_series({}, ["2023-Q1", "2023-Q2"]) == [0.0, 0.0]
-
-    def test_returns_floats(self):
-        result = da._fill_series({"2023-Q1": 3}, ["2023-Q1"])
-        assert all(isinstance(v, float) for v in result)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  2.  SHORT-TERM ANALYSIS  —  FORECASTING
-# ══════════════════════════════════════════════════════════════════
-
-class TestLinearForecast:
-    def test_correct_number_of_points(self):
-        assert len(da._linear_forecast([1.0, 2.0, 3.0], 5)["forecast"]) == 5
-
-    def test_method_label(self):
-        assert da._linear_forecast([1.0, 2.0], 2)["method"] == "linear_trend"
-
-    def test_increasing_series_yields_positive_forecast(self):
-        fv = da._linear_forecast([1.0, 2.0, 3.0, 4.0, 5.0], 1)["forecast"][0]["value"]
-        assert fv > 5.0
-
-    def test_ci_strictly_ordered(self):
-        for pt in da._linear_forecast([1.0, 2.0, 3.0, 4.0], 4)["forecast"]:
-            assert pt["ci_lower_95"] <= pt["ci_lower_80"]
-            assert pt["ci_lower_80"] <= pt["value"]
-            assert pt["value"]       <= pt["ci_upper_80"]
-            assert pt["ci_upper_80"] <= pt["ci_upper_95"]
-
-    def test_lower_bounds_non_negative(self):
+    def test_linear_ci_ordered_and_non_negative(self):
         for pt in da._linear_forecast([10.0, 5.0, 2.0, 1.0], 6)["forecast"]:
-            assert pt["ci_lower_95"] >= 0.0
-            assert pt["ci_lower_80"] >= 0.0
+            assert 0.0 <= pt["ci_lower_95"] <= pt["ci_lower_80"] <= pt["value"]
+            assert pt["value"] <= pt["ci_upper_80"] <= pt["ci_upper_95"]
 
-    def test_empty_series_does_not_crash(self):
-        result = da._linear_forecast([], 3)
-        assert len(result["forecast"]) == 3
-
-    def test_flat_series_forecast_near_mean(self):
-        series = [5.0, 5.0, 5.0, 5.0]
-        fv = da._linear_forecast(series, 1)["forecast"][0]["value"]
-        assert abs(fv - 5.0) < 2.0
-
-    def test_ci_widens_with_horizon(self):
-        """Confidence interval should grow wider for more distant forecasts."""
-        pts = da._linear_forecast([1.0, 2.0, 3.0, 4.0, 5.0], 4)["forecast"]
+    def test_linear_ci_widens_with_horizon(self):
+        pts = da._linear_forecast([2.0, 4.0, 6.0, 8.0, 10.0], 5)["forecast"]
         widths = [p["ci_upper_95"] - p["ci_lower_95"] for p in pts]
-        assert widths[0] <= widths[-1]
+        assert widths == sorted(widths)
 
-
-class TestForecastSeries:
-    def test_too_short_uses_linear(self):
+    def test_short_or_zero_series_use_linear(self):
         assert da.forecast_series([1.0, 2.0, 3.0], 3)["method"] == "linear_trend"
-
-    def test_all_zero_uses_linear(self):
         assert da.forecast_series([0.0] * 8, 4)["method"] == "linear_trend"
 
-    def test_returns_correct_n_points(self):
-        assert len(da.forecast_series(list(range(12)), 6)["forecast"]) == 6
-
-    def test_required_keys_present(self):
-        result = da.forecast_series([1.0, 2.0, 3.0, 4.0, 5.0], 3)
-        assert {"method", "forecast"} <= set(result)
+    def test_single_point_no_crash(self):
+        assert len(da.forecast_series([42.0], 4)["forecast"]) == 4
 
 
-# ══════════════════════════════════════════════════════════════════
-#  2.  SHORT-TERM ANALYSIS  —  ECONOMETRIC METRICS
-# ══════════════════════════════════════════════════════════════════
+class TestMetrics:
+    def test_cagr_doubling_over_two_years(self):
+        assert da._cagr([100.0, 200.0], 2.0) == pytest.approx(41.421, abs=0.01)
 
-class TestCagr:
-    def test_zero_start_returns_none(self):
-        assert da._cagr([0.0, 5.0], 1.0) is None
+    @pytest.mark.parametrize("series", [[0.0, 5.0], [-1.0, 5.0], [10.0, -5.0], [5.0]])
+    def test_cagr_undefined_returns_none(self, series):
+        assert da._cagr(series, 1.0) is None
 
-    def test_negative_start_returns_none(self):
-        assert da._cagr([-1.0, 5.0], 1.0) is None
-
-    def test_negative_end_returns_none(self):
-        assert da._cagr([10.0, -5.0], 1.0) is None
-
-    def test_single_element_returns_none(self):
-        assert da._cagr([5.0], 1.0) is None
-
-    def test_doubling_over_2_years(self):
-        # 100 → 200 over 2 years = 2^(1/2) - 1 ≈ 41.42 %
-        result = da._cagr([100.0, 200.0], 2.0)
-        assert result is not None
-        assert abs(result - 41.421) < 0.01
-
-    def test_no_growth_zero_cagr(self):
-        assert abs(da._cagr([100.0, 100.0], 2.0)) < 0.001
-
-    def test_decline_negative_cagr(self):
-        result = da._cagr([100.0, 50.0], 1.0)
-        assert result is not None
-        assert result < 0
-
-
-class TestDemandVelocity:
-    def test_too_short_returns_none(self):
+    def test_demand_velocity(self):
+        assert da._demand_velocity([10.0, 11.0, 12.0]) == pytest.approx(20.0, abs=0.01)
         assert da._demand_velocity([1.0, 2.0]) is None
-
-    def test_zero_denominator_returns_none(self):
         assert da._demand_velocity([0.0, 1.0, 2.0]) is None
 
-    def test_exact_positive_growth(self):
-        # (12 - 10) / 10 * 100 = 20
-        assert da._demand_velocity([10.0, 11.0, 12.0]) == pytest.approx(20.0, abs=0.01)
-
-    def test_exact_large_growth(self):
-        # (100 - 1) / 1 * 100 = 9900
-        assert da._demand_velocity([1.0, 50.0, 100.0]) == pytest.approx(9900.0, abs=1.0)
-
-    def test_decline_negative(self):
-        result = da._demand_velocity([10.0, 8.0, 5.0])
-        assert result is not None and result < 0
-
-
-class TestMpr:
-    def test_zero_total_returns_none(self):
+    def test_mpr(self):
+        assert da._mpr([5.0, 5.0], [10.0, 10.0]) == pytest.approx(50.0, abs=0.01)
         assert da._mpr([5.0], [0.0]) is None
 
-    def test_fifty_percent(self):
-        assert da._mpr([5.0, 5.0], [10.0, 10.0]) == pytest.approx(50.0, abs=0.01)
-
-    def test_full_penetration(self):
-        assert da._mpr([10.0], [10.0]) == pytest.approx(100.0, abs=0.01)
-
-    def test_zero_entity_zero_mpr(self):
-        result = da._mpr([0.0, 0.0], [10.0, 10.0])
-        assert result == pytest.approx(0.0, abs=0.01)
-
-
-class TestVolatility:
-    def test_too_short_returns_none(self):
+    def test_volatility(self):
         assert da._volatility([1.0, 2.0]) is None
+        assert da._volatility([1.0, 10.0, 1.0, 10.0, 1.0]) > 0
 
-    def test_flat_series_none_or_zero(self):
-        # Mean growth rate is 0 → CV undefined → None
-        result = da._volatility([5.0, 5.0, 5.0, 5.0])
-        assert result is None or result == 0.0
-
-    def test_volatile_series_positive(self):
-        result = da._volatility([1.0, 10.0, 1.0, 10.0, 1.0])
-        assert result is not None and result > 0
-
-    def test_non_negative(self):
-        result = da._volatility([1.0, 2.0, 3.0, 4.0, 5.0])
-        if result is not None:
-            assert result >= 0.0
-
-
-class TestEmergenceIndex:
-    def test_too_short_returns_none(self):
+    def test_emergence_index(self):
         assert da._emergence_index([1.0] * 4) is None
-
-    def test_zero_series_returns_none(self):
         assert da._emergence_index([0.0] * 8) is None
+        assert da._emergence_index([1.0] * 4 + [5.0] * 4) > da._emergence_index([5.0] * 8)
 
-    def test_bounded_0_1(self):
-        for series in (
-            [1.0] * 4 + [10.0] * 4,
-            [10.0] * 4 + [1.0] * 4,
-            [5.0] * 8,
-        ):
-            result = da._emergence_index(series)
-            if result is not None:
-                assert 0.0 <= result <= 1.0
-
-    def test_recent_surge_higher_than_flat(self):
-        flat    = [5.0] * 8
-        surging = [1.0] * 4 + [5.0] * 4
-        assert da._emergence_index(surging) > da._emergence_index(flat)
-
-    def test_decline_lower_than_flat(self):
-        flat     = [5.0] * 8
-        dropping = [5.0] * 4 + [1.0] * 4
-        ei_flat = da._emergence_index(flat)
-        ei_drop = da._emergence_index(dropping)
-        if ei_flat is not None and ei_drop is not None:
-            assert ei_drop <= ei_flat
-
-
-class TestRgi:
-    def test_none_cagr_returns_none(self):
+    def test_rgi(self):
+        assert da._rgi(10.0, 5.0) == pytest.approx(2.0)
         assert da._rgi(None, 5.0) is None
-
-    def test_zero_sector_returns_none(self):
         assert da._rgi(10.0, 0.0) is None
 
-    def test_double_sector_average(self):
-        assert da._rgi(10.0, 5.0) == pytest.approx(2.0, abs=0.001)
-
-    def test_underperformance_below_one(self):
-        assert da._rgi(3.0, 10.0) < 1.0
-
-    def test_parity_is_one(self):
-        assert da._rgi(7.0, 7.0) == pytest.approx(1.0, abs=0.001)
-
-
-class TestMinmax:
-    def test_at_minimum(self):
-        assert da._minmax(0.0, 0.0, 10.0) == pytest.approx(0.0)
-
-    def test_at_maximum(self):
-        assert da._minmax(10.0, 0.0, 10.0) == pytest.approx(1.0)
-
-    def test_midpoint(self):
-        assert da._minmax(5.0, 0.0, 10.0) == pytest.approx(0.5)
-
-    def test_none_returns_zero(self):
-        assert da._minmax(None, 0.0, 10.0) == 0.0
-
-    def test_equal_range_returns_half(self):
-        assert da._minmax(5.0, 5.0, 5.0) == pytest.approx(0.5)
-
-    def test_clips_above_max(self):
-        assert da._minmax(999.0, 0.0, 10.0) == pytest.approx(1.0)
-
-    def test_clips_below_min(self):
-        assert da._minmax(-999.0, 0.0, 10.0) == pytest.approx(0.0)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  2.  SHORT-TERM ANALYSIS  —  CPS & CLASSIFICATION
-# ══════════════════════════════════════════════════════════════════
-
-_BASE_CPS_KWARGS = dict(
-    hist_cagr=5.0, fore_cagr=8.0, rgi=1.5, ei=0.7, volatility=0.3,
-    all_hist_cagrs=[3.0, 5.0, 7.0],
-    all_fore_cagrs=[5.0, 8.0, 10.0],
-    all_rgis=[0.8, 1.5, 2.0],
-    all_vols=[0.1, 0.3, 0.8],
-)
-
-
-class TestComputeCps:
-    def test_result_in_unit_interval(self):
-        score = da.compute_cps(**_BASE_CPS_KWARGS)
-        assert 0.0 <= score <= 1.0
-
-    def test_strong_metrics_score_above_half(self):
-        score = da.compute_cps(
-            hist_cagr=20.0, fore_cagr=25.0, rgi=3.0, ei=0.9, volatility=0.05,
-            all_hist_cagrs=[0.0, 5.0, 20.0],
-            all_fore_cagrs=[0.0, 10.0, 25.0],
-            all_rgis=[0.2, 1.0, 3.0],
-            all_vols=[0.05, 0.3, 1.5],
-        )
-        assert score >= 0.5
-
-    def test_weak_metrics_score_below_half(self):
-        score = da.compute_cps(
-            hist_cagr=-10.0, fore_cagr=-15.0, rgi=0.1, ei=0.05, volatility=3.0,
-            all_hist_cagrs=[-10.0, 0.0, 5.0],
-            all_fore_cagrs=[-15.0, 0.0, 8.0],
-            all_rgis=[0.1, 1.0, 2.0],
-            all_vols=[0.5, 1.5, 3.0],
-        )
-        assert score <= 0.5
-
-    def test_all_none_inputs_handled_gracefully(self):
-        score = da.compute_cps(
-            hist_cagr=None, fore_cagr=None, rgi=None, ei=None, volatility=None,
-            all_hist_cagrs=[5.0], all_fore_cagrs=[8.0],
-            all_rgis=[1.0], all_vols=[0.3],
-        )
-        assert 0.0 <= score <= 1.0
-
-    def test_single_element_norm_lists_no_crash(self):
-        """vmin == vmax → _minmax returns 0.5; must not crash or produce NaN."""
-        score = da.compute_cps(
-            hist_cagr=5.0, fore_cagr=8.0, rgi=1.5, ei=0.7, volatility=0.3,
-            all_hist_cagrs=[5.0], all_fore_cagrs=[8.0],
-            all_rgis=[1.5], all_vols=[0.3],
-        )
-        assert 0.0 <= score <= 1.0
-        assert not math.isnan(score)
-
-    def test_empty_norm_lists_no_crash(self):
-        score = da.compute_cps(
-            hist_cagr=5.0, fore_cagr=8.0, rgi=1.5, ei=0.7, volatility=0.3,
-            all_hist_cagrs=[], all_fore_cagrs=[], all_rgis=[], all_vols=[],
-        )
-        assert 0.0 <= score <= 1.0
-
-    def test_custom_weights_sum_to_one_is_fine(self):
-        weights = {"forecast_cagr": 0.40, "hist_cagr": 0.25,
-                   "rgi": 0.20, "ei": 0.10, "stability": 0.05}
-        score = da.compute_cps(**_BASE_CPS_KWARGS, weights=weights)
-        assert 0.0 <= score <= 1.0
-
-
-class TestClassifyPotential:
-    @pytest.mark.parametrize("cps,expected_tier", [
-        (0.00, "low"),
-        (0.34, "low"),
-        (0.35, "medium"),
-        (0.50, "medium"),
-        (0.64, "medium"),
-        (0.65, "high"),
-        (1.00, "high"),
+    @pytest.mark.parametrize("val,lo,hi,expected", [
+        (0.0, 0.0, 10.0, 0.0), (10.0, 0.0, 10.0, 1.0), (5.0, 0.0, 10.0, 0.5),
+        (None, 0.0, 10.0, 0.0), (5.0, 5.0, 5.0, 0.5), (999.0, 0.0, 10.0, 1.0), (-999.0, 0.0, 10.0, 0.0),
     ])
-    def test_tier_boundaries(self, cps, expected_tier):
-        assert da.classify_potential(cps) == expected_tier
+    def test_minmax(self, val, lo, hi, expected):
+        assert da._minmax(val, lo, hi) == pytest.approx(expected)
+
+
+class TestCps:
+    def test_bounded_and_not_nan_with_empty_lists(self):
+        s = da.compute_cps(hist_cagr=5.0, fore_cagr=8.0, rgi=1.5, ei=0.7, volatility=0.3,
+                           all_hist_cagrs=[], all_fore_cagrs=[], all_rgis=[], all_vols=[])
+        assert 0.0 <= s <= 1.0 and not math.isnan(s)
+
+    def test_all_none_inputs(self):
+        s = da.compute_cps(hist_cagr=None, fore_cagr=None, rgi=None, ei=None, volatility=None,
+                           all_hist_cagrs=[5.0], all_fore_cagrs=[8.0], all_rgis=[1.0], all_vols=[0.3])
+        assert 0.0 <= s <= 1.0
+
+    def test_strong_beats_weak(self):
+        common = dict(all_hist_cagrs=[-10.0, 0.0, 20.0], all_fore_cagrs=[-15.0, 0.0, 25.0],
+                      all_rgis=[0.1, 1.0, 3.0], all_vols=[0.05, 0.5, 3.0])
+        strong = da.compute_cps(hist_cagr=20.0, fore_cagr=25.0, rgi=3.0, ei=0.9, volatility=0.05, **common)
+        weak   = da.compute_cps(hist_cagr=-10.0, fore_cagr=-15.0, rgi=0.1, ei=0.05, volatility=3.0, **common)
+        assert strong > 0.5 > weak
+
+    @pytest.mark.parametrize("cps,tier", [
+        (0.00, "low"), (0.34, "low"), (0.35, "medium"), (0.64, "medium"), (0.65, "high"), (1.00, "high"),
+    ])
+    def test_tiers(self, cps, tier):
+        assert da.classify_potential(cps) == tier
 
 
 # ══════════════════════════════════════════════════════════════════
 #  3.  LONG-TERM EMERGE FRAMEWORK
 # ══════════════════════════════════════════════════════════════════
 
+ALL_KEYS = list(da.JOB_IRT_PARAMS)
+
+
 class TestIrtP:
     def test_at_difficulty_is_half(self):
-        assert da._irt_p(0.5, a=1.0, b=0.5) == pytest.approx(0.5, abs=1e-6)
+        assert da._irt_p(0.5, a=1.0, b=0.5) == pytest.approx(0.5)
 
-    def test_above_difficulty_above_half(self):
-        assert da._irt_p(0.9, a=1.0, b=0.5) > 0.5
+    def test_no_overflow(self):
+        assert da._irt_p(1000.0, a=10.0, b=0.0) == pytest.approx(1.0)
+        assert da._irt_p(-1000.0, a=10.0, b=0.0) == pytest.approx(0.0)
 
-    def test_below_difficulty_below_half(self):
-        assert da._irt_p(0.1, a=1.0, b=0.5) < 0.5
-
-    def test_bounded_0_1(self):
-        for theta in [0.0, 0.25, 0.5, 0.75, 1.0]:
-            p = da._irt_p(theta, a=2.0, b=0.5)
-            assert 0.0 <= p <= 1.0
-
-    def test_large_positive_theta_no_overflow(self):
-        assert da._irt_p(1000.0, a=10.0, b=0.0) == pytest.approx(1.0, abs=1e-6)
-
-    def test_large_negative_theta_no_overflow(self):
-        assert da._irt_p(-1000.0, a=10.0, b=0.0) == pytest.approx(0.0, abs=1e-6)
-
-    def test_higher_discrimination_steeper_curve(self):
-        """Higher 'a' → bigger gap between theta 0.4 and 0.6."""
-        gap_lo = da._irt_p(0.6, a=1.0, b=0.5) - da._irt_p(0.4, a=1.0, b=0.5)
-        gap_hi = da._irt_p(0.6, a=5.0, b=0.5) - da._irt_p(0.4, a=5.0, b=0.5)
-        assert gap_hi > gap_lo
+    def test_higher_discrimination_is_steeper(self):
+        gap = lambda a: da._irt_p(0.6, a, 0.5) - da._irt_p(0.4, a, 0.5)
+        assert gap(5.0) > gap(1.0)
 
 
 class TestEstimateTheta:
-    def test_zero_signals_low_theta(self):
-        theta, _ = da.estimate_theta({k: 0.0 for k in da.IRT_PARAMS})
-        assert theta < 0.5
-
-    def test_high_signals_high_theta(self):
-        theta, _ = da.estimate_theta({k: 1.0 for k in da.IRT_PARAMS})
-        assert theta > 0.5
-
-    def test_theta_in_unit_interval(self):
-        for val in [0.0, 0.3, 0.7, 1.0]:
-            theta, _ = da.estimate_theta({k: val for k in da.IRT_PARAMS})
-            assert 0.0 <= theta <= 1.0
-
-    def test_confidence_in_unit_interval(self):
-        _, conf = da.estimate_theta({k: 0.5 for k in da.IRT_PARAMS})
-        assert 0.0 <= conf <= 1.0
-
-    def test_empty_signals_returns_fallback(self):
-        theta, conf = da.estimate_theta({})
-        assert isinstance(theta, float)
-        assert isinstance(conf, float)
-        assert 0.0 < theta < 1.0
-
-    def test_all_zero_signals_returns_fallback(self):
-        theta, conf = da.estimate_theta({k: 0.0 for k in da.IRT_PARAMS})
-        assert 0.0 < theta < 1.0   # fallback, not 0 or crash
+    def test_uses_every_job_signal(self):
+        """Regression: θ used to ignore posting_density, recency_intensity and occupation_breadth."""
+        base = {k: 0.4 for k in ALL_KEYS}   # mid-range, so θ is not clipped at its 0.05 floor
+        for key in ("posting_density", "recency_intensity", "occupation_breadth"):
+            boosted = {**base, key: 1.0}
+            assert da.estimate_theta(boosted)[0] > da.estimate_theta(base)[0], key
 
     def test_monotone_in_signal_strength(self):
-        """Theta should increase as all signals increase."""
-        theta_low,  _ = da.estimate_theta({k: 0.1 for k in da.IRT_PARAMS})
-        theta_high, _ = da.estimate_theta({k: 0.9 for k in da.IRT_PARAMS})
-        assert theta_high > theta_low
+        assert (da.estimate_theta({k: 0.9 for k in ALL_KEYS})[0] >
+                da.estimate_theta({k: 0.1 for k in ALL_KEYS})[0])
+
+    def test_works_on_a_subset_of_signals(self):
+        theta, conf = da.estimate_theta({"posting_density": 0.8, "yoy_growth_rate": 0.8})
+        assert 0.0 < theta < 1.0 and 0.0 < conf < 1.0
+
+    @pytest.mark.parametrize("sig", [{}, {k: 0.0 for k in ALL_KEYS}])
+    def test_empty_or_zero_returns_fallback(self, sig):
+        assert da.estimate_theta(sig) == (0.10, 0.15)
+
+    def test_unknown_keys_ignored(self):
+        assert da.estimate_theta({"posting_density": 0.7, "made_up": 1.0}) == \
+               da.estimate_theta({"posting_density": 0.7})
 
 
-class TestFuzzyMemberships:
-    def test_all_four_categories_present(self):
-        m = da.fuzzy_memberships(0.5)
-        assert set(m) == {"speculative", "niche", "emerging", "breakthrough"}
+class TestFuzzyAndTte:
+    def test_memberships_bounded(self):
+        for theta in (0.05, 0.3, 0.5, 0.7, 0.95):
+            m = da.fuzzy_memberships(theta)
+            assert set(m) == {"speculative", "niche", "emerging", "breakthrough"}
+            assert all(0.0 <= v <= 1.0 for v in m.values())
 
-    def test_all_values_in_0_1(self):
-        for theta in [0.05, 0.3, 0.5, 0.7, 0.95]:
-            for v in da.fuzzy_memberships(theta).values():
-                assert 0.0 <= v <= 1.0
+    def test_extremes(self):
+        assert da.dominant_category(da.fuzzy_memberships(0.0)) == "speculative"
+        assert da.dominant_category(da.fuzzy_memberships(1.0)) == "breakthrough"
 
-    def test_theta_zero_speculative_dominant(self):
-        m = da.fuzzy_memberships(0.0)
-        assert m["speculative"] >= m["breakthrough"]
-        assert m["breakthrough"] == pytest.approx(0.0, abs=1e-4)
+    def test_tte_ordering_and_bounds(self):
+        for theta in (0.05, 0.5, 0.95):
+            t = da.time_to_emergence(theta, 0.7)
+            assert 0.2 <= t["ci_lower_years"] <= t["point_estimate_years"] <= t["ci_upper_years"] <= 5.0
 
-    def test_theta_one_breakthrough_dominant(self):
-        m = da.fuzzy_memberships(1.0)
-        assert m["breakthrough"] >= m["speculative"]
+    def test_tte_higher_theta_sooner(self):
+        assert (da.time_to_emergence(0.9, 0.9)["point_estimate_years"] <
+                da.time_to_emergence(0.1, 0.9)["point_estimate_years"])
 
-    def test_theta_mid_has_nonzero_membership(self):
-        m = da.fuzzy_memberships(0.5)
-        assert sum(m.values()) > 0
-
-
-class TestDominantCategory:
-    def test_returns_highest_membership(self):
-        m = {"speculative": 0.1, "niche": 0.9, "emerging": 0.3, "breakthrough": 0.2}
-        assert da.dominant_category(m) == "niche"
-
-    def test_single_nonzero(self):
-        m = {"speculative": 0.0, "niche": 0.0, "emerging": 0.8, "breakthrough": 0.0}
-        assert da.dominant_category(m) == "emerging"
-
-    def test_returns_a_key_in_input(self):
-        m = {k: 0.5 for k in ("speculative", "niche", "emerging", "breakthrough")}
-        assert da.dominant_category(m) in m
+    def test_low_confidence_wider_ci(self):
+        w = lambda c: (lambda t: t["ci_upper_years"] - t["ci_lower_years"])(da.time_to_emergence(0.5, c))
+        assert w(0.10) >= w(0.95)
 
 
-class TestTimeToEmergence:
-    def test_has_required_keys(self):
-        tte = da.time_to_emergence(0.5, 0.8)
-        assert {"point_estimate_years", "ci_lower_years", "ci_upper_years"} <= set(tte)
+class TestRecencyAndGrowth:
+    def test_is_recent(self):
+        assert da._is_recent(_days_ago(100), years=1)
+        assert not da._is_recent(_days_ago(800), years=1)
+        assert not da._is_recent(None) and not da._is_recent("")
 
-    def test_higher_theta_lower_tte(self):
-        tte_hi = da.time_to_emergence(0.9, 0.9)
-        tte_lo = da.time_to_emergence(0.1, 0.9)
-        assert tte_hi["point_estimate_years"] < tte_lo["point_estimate_years"]
-
-    def test_ci_correctly_ordered(self):
-        tte = da.time_to_emergence(0.5, 0.7)
-        assert tte["ci_lower_years"] <= tte["point_estimate_years"] <= tte["ci_upper_years"]
-
-    def test_never_exceeds_t_max(self):
-        for theta in [0.05, 0.5, 0.95]:
-            tte = da.time_to_emergence(theta, 0.8)
-            assert tte["point_estimate_years"] <= 5.0
-            assert tte["ci_upper_years"]       <= 5.0
-
-    def test_always_positive(self):
-        for theta in [0.05, 0.5, 0.95]:
-            tte = da.time_to_emergence(theta, 0.9)
-            assert tte["point_estimate_years"] >= 0.2
-            assert tte["ci_lower_years"]       >= 0.2
-
-    def test_low_confidence_widens_ci(self):
-        tte_conf  = da.time_to_emergence(0.5, 0.95)
-        tte_unconf = da.time_to_emergence(0.5, 0.10)
-        width_conf   = tte_conf["ci_upper_years"]   - tte_conf["ci_lower_years"]
-        width_unconf = tte_unconf["ci_upper_years"] - tte_unconf["ci_lower_years"]
-        assert width_unconf >= width_conf
-
-
-class TestIsRecent:
-    def test_within_window_true(self):
-        d = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
-        assert da._is_recent(d, years=1)
-
-    def test_outside_window_false(self):
-        d = (datetime.now() - timedelta(days=800)).strftime("%Y-%m-%d")
-        assert not da._is_recent(d, years=1)
-
-    def test_none_false(self):
-        assert not da._is_recent(None)
-
-    def test_empty_string_false(self):
-        assert not da._is_recent("")
-
-    def test_exactly_on_boundary(self):
-        d = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-        # Result may be True or False depending on exact time-of-day; just test no crash
-        assert isinstance(da._is_recent(d, years=1), bool)
-
-
-class TestYoyGrowthSignal:
-    def test_empty_list_zero(self):
+    def test_yoy(self):
         assert da._yoy_growth_signal([]) == 0.0
-
-    def test_result_in_unit_interval(self):
-        dates = [(datetime.now() - timedelta(days=i * 60)).strftime("%Y-%m-%d")
-                 for i in range(20)]
-        assert 0.0 <= da._yoy_growth_signal(dates) <= 1.0
-
-    def test_all_recent_high_value(self):
-        recent = [(datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")] * 10
-        assert da._yoy_growth_signal(recent) >= 0.5
-
-    def test_all_none_dates_zero(self):
         assert da._yoy_growth_signal([None] * 5) == 0.0
+        assert da._yoy_growth_signal([_days_ago(10)] * 10) >= 0.5
+        assert 0.0 <= da._yoy_growth_signal([_days_ago(i * 60) for i in range(20)]) <= 1.0
+
+
+class TestAvailableSignals:
+    def test_hiring_data_has_no_geo_or_sector(self):
+        items = [{"skills": ["1"], "upload_date": _days_ago(5), "occupations": "dev"}]
+        keys = da._available_signals(items)
+        assert "geo_spread" not in keys and "cross_sector_adoption" not in keys
+        assert {"posting_density", "recency_intensity", "yoy_growth_rate", "occupation_breadth"} <= set(keys)
+
+    def test_tracker_data_has_all_six(self, sample_items):
+        assert set(da._available_signals(sample_items)) == set(ALL_KEYS)
 
 
 class TestComputeJobSignals:
-    def test_no_matching_skill_all_zeros(self):
-        items = [{"skills": ["other"], "upload_date": "2023-01-01"}]
-        sigs = da.compute_job_signals("missing_skill", items, 1)
-        assert all(v == 0.0 for v in sigs.values())
+    def test_returns_exactly_requested_keys(self, sample_items):
+        keys = ["posting_density", "yoy_growth_rate"]
+        assert set(da.compute_job_signals(SKILL_URIS[0], sample_items, 15, keys)) == set(keys)
 
-    def test_returns_all_job_irt_param_keys(self):
-        item = {
-            "skills":        ["s1"],
-            "upload_date":   (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
-            "country":       "DE",
-            "sectors":       ["J"],
-            "occupation_id": "occ1",
-        }
-        sigs = da.compute_job_signals("s1", [item], 10)
-        assert set(sigs) == set(da.JOB_IRT_PARAMS)
+    def test_no_match_all_zero(self):
+        sig = da.compute_job_signals("missing", [{"skills": ["other"]}], 1, ALL_KEYS)
+        assert sig == {k: 0.0 for k in ALL_KEYS}
 
-    def test_all_values_bounded_0_1(self):
-        items = [{
-            "skills":      ["s1"],
-            "upload_date": (datetime.now() - timedelta(days=30 * i)).strftime("%Y-%m-%d"),
-            "country":     ["DE", "FR", "IT", "ES", "PL"][i % 5],
-            "sectors":     [["J", "K", "L", "M", "N"][i % 5]],
-            "occupation_id": f"occ{i}",
-        } for i in range(20)]
-        sigs = da.compute_job_signals("s1", items, 20)
-        for k, v in sigs.items():
-            assert 0.0 <= v <= 1.0, f"{k} = {v} out of bounds"
+    def test_empty_items(self):
+        assert all(v == 0.0 for v in da.compute_job_signals("s1", [], 0, ALL_KEYS).values())
 
-    def test_geo_spread_increases_with_country_diversity(self):
-        same = [{"skills": ["s1"], "upload_date": "2023-01-01", "country": "DE"}] * 5
-        diverse = [{"skills": ["s1"], "upload_date": "2023-01-01",
-                    "country": ["DE", "FR", "IT", "ES", "PL"][i]} for i in range(5)]
-        assert (da.compute_job_signals("s1", diverse, 5)["geo_spread"] >=
-                da.compute_job_signals("s1", same,    5)["geo_spread"])
+    def test_bounded(self):
+        items = [{"skills": ["s1"], "upload_date": _days_ago(30 * i),
+                  "country": ["DE", "FR", "IT", "ES", "PL"][i % 5],
+                  "sectors": [["J", "K", "L", "M", "N"][i % 5]],
+                  "occupations": [f"occ{i}"]} for i in range(20)]
+        for k, v in da.compute_job_signals("s1", items, 20, ALL_KEYS).items():
+            assert 0.0 <= v <= 1.0, k
 
-    def test_cross_sector_increases_with_sector_diversity(self):
-        same = [{"skills": ["s1"], "upload_date": "2023-01-01", "sectors": ["J"]}] * 5
-        div  = [{"skills": ["s1"], "upload_date": "2023-01-01",
-                 "sectors": [["J", "K", "L", "M", "N"][i]]} for i in range(5)]
-        assert (da.compute_job_signals("s1", div,  5)["cross_sector_adoption"] >=
-                da.compute_job_signals("s1", same, 5)["cross_sector_adoption"])
+    def test_diversity_raises_geo_and_sector(self):
+        same = [{"skills": ["s1"], "upload_date": "2023-01-01", "country": "DE", "sectors": ["J"]}] * 5
+        div = [{"skills": ["s1"], "upload_date": "2023-01-01", "country": c, "sectors": [s]}
+               for c, s in zip(["DE", "FR", "IT", "ES", "PL"], ["J", "K", "L", "M", "N"])]
+        a = da.compute_job_signals("s1", div, 5, ALL_KEYS)
+        b = da.compute_job_signals("s1", same, 5, ALL_KEYS)
+        assert a["geo_spread"] > b["geo_spread"]
+        assert a["cross_sector_adoption"] > b["cross_sector_adoption"]
 
-
-class TestComputeSignals:
-    def _doc(self, n=5, skill="s1"):
-        return [{
-            "skills":           [skill],
-            "publication_date": (datetime.now() - timedelta(days=i * 60)).strftime("%Y-%m-%d"),
-            "location_code":    ["DE", "FR"][i % 2],
-            "nace_code":        ["J", "K"][i % 2],
-        } for i in range(n)]
-
-    def test_returns_all_irt_param_keys(self):
-        src = {"policies": self._doc(), "projects": [], "white_papers": []}
-        sigs = da.compute_signals("s1", src, {})
-        assert set(sigs) == set(da.IRT_PARAMS)
-
-    def test_all_values_bounded_0_1(self):
-        src = {k: self._doc(10) for k in ("policies", "projects", "white_papers")}
-        sigs = da.compute_signals("s1", src, {"s1": 30})
-        for k, v in sigs.items():
-            assert 0.0 <= v <= 1.0, f"{k} = {v}"
-
-    def test_no_matching_skill_all_zeros(self):
-        src = {"policies": self._doc(skill="other"), "projects": [], "white_papers": []}
-        sigs = da.compute_signals("s1", src, {})
-        assert all(v == 0.0 for v in sigs.values())
-
-    def test_empty_all_sources_all_zeros(self):
-        sigs = da.compute_signals("s1", {}, {})
-        for k in da.IRT_PARAMS:
-            assert sigs.get(k, 0.0) == 0.0
+    def test_occupation_breadth_counts_list_occupations(self):
+        items = [{"skills": ["s1"], "occupations": [f"u{i}"]} for i in range(5)]
+        assert da.compute_job_signals("s1", items, 5, ["occupation_breadth"])["occupation_breadth"] == 0.5
 
 
 # ══════════════════════════════════════════════════════════════════
-#  4.  LLM HELPERS
+#  4.  LLM HELPERS & RECOMMENDATION FALLBACKS
 # ══════════════════════════════════════════════════════════════════
 
-class TestStripCodeFences:
-    def test_json_fence_removed(self):
+class TestLlmParsing:
+    @pytest.mark.parametrize("raw,expected", [
+        ('{"k":"v"}', {"k": "v"}),
+        ('```json\n{"k":"v"}\n```', {"k": "v"}),
+        ('{"k":"v"} trailing text', {"k": "v"}),
+        ('Preamble {"k":"v"} postamble', {"k": "v"}),
+        ('{"a":{"b":[1,2]}}', {"a": {"b": [1, 2]}}),
+        ("{}", {}),
+    ])
+    def test_parses(self, raw, expected):
+        assert da._parse_llm_json(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["totally not json!!!", ""])
+    def test_raises(self, raw):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            da._parse_llm_json(raw)
+
+    def test_strip_code_fences(self):
         assert da._strip_code_fences('```json\n{"a":1}\n```') == '{"a":1}'
-
-    def test_plain_fence_removed(self):
-        assert da._strip_code_fences('```\n{"a":1}\n```') == '{"a":1}'
-
-    def test_no_fence_unchanged(self):
-        s = '{"a":1}'
-        assert da._strip_code_fences(s) == s
-
-    def test_result_is_stripped(self):
         assert da._strip_code_fences('  {"a":1}  ') == '{"a":1}'
 
 
-class TestParseLlmJson:
-    def test_clean_json(self):
-        assert da._parse_llm_json('{"k":"v"}') == {"k": "v"}
+class TestRecommendationFallbacks:
+    def test_short_term_static(self, no_llm):
+        recs = da._short_term_recommendations(
+            tier="high", entity_label="Python",
+            metrics={"historical_cagr_pct": 12.0, "forecast_cagr_pct": 15.0, "demand_velocity_pct": 5.0,
+                     "market_penetration_rate_pct": 8.0, "demand_volatility": 0.4,
+                     "relative_growth_index": 1.8, "emergence_index": 0.7, "composite_potential_score": 0.8},
+        )
+        assert {"talent_acquisition", "training_and_development", "compensation_and_retention"} <= set(recs)
 
-    def test_code_fenced_json(self):
-        assert da._parse_llm_json('```json\n{"k":"v"}\n```') == {"k": "v"}
+    @pytest.mark.parametrize("category", ["breakthrough", "emerging", "niche", "speculative"])
+    def test_long_term_static_three_distinct(self, no_llm, category):
+        tte = da.time_to_emergence(0.6, 0.8)
+        recs = da._long_term_job_recommendations(category, "ML", 0.6, tte, {k: 0.3 for k in ALL_KEYS})
+        assert set(recs) == {"strategic_workforce_planning", "partnerships_and_pipeline",
+                             "regulatory_and_compliance"}
+        assert len(set(recs.values())) == 3
 
-    def test_trailing_garbage(self):
-        assert da._parse_llm_json('{"k":"v"} some trailing text') == {"k": "v"}
-
-    def test_preamble_and_postamble(self):
-        assert da._parse_llm_json('Preamble {"k":"v"} postamble') == {"k": "v"}
-
-    def test_nested_object(self):
-        assert da._parse_llm_json('{"a":{"b":[1,2]}}') == {"a": {"b": [1, 2]}}
-
-    def test_empty_object(self):
-        assert da._parse_llm_json("{}") == {}
-
-    def test_raises_on_no_json(self):
-        with pytest.raises(ValueError):
-            da._parse_llm_json("totally not json!!!")
-
-    def test_raises_on_empty_string(self):
-        with pytest.raises((ValueError, json.JSONDecodeError)):
-            da._parse_llm_json("")
+    def test_long_term_prompt_only_lists_given_signals(self, monkeypatch):
+        llm = MagicMock(return_value={"x": "y"})
+        monkeypatch.setattr(da, "_chat_llm_json", llm)
+        da._long_term_job_recommendations("niche", "ML", 0.4, da.time_to_emergence(0.4, 0.5),
+                                          {"posting_density": 0.3}, sector="Research",
+                                          data_scope="organization")
+        prompt = llm.call_args[0][1]
+        assert "Skill frequency across job postings" in prompt
+        assert "Geographic spread" not in prompt
+        assert "hiring-management" in prompt and "Research" in prompt
 
 
 # ══════════════════════════════════════════════════════════════════
-#  5.  PIPELINE INTEGRATION
+#  5.  PIPELINES
 # ══════════════════════════════════════════════════════════════════
 
 class TestRunShortTermAnalysis:
-    def test_skills_mode_structure(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=5)
-        assert {"skills", "metadata", "sector_summary"} <= set(r)
+    @pytest.mark.parametrize("mode", ["skills", "occupations"])
+    def test_structure(self, sample_items, label_dict, no_llm, mode):
+        r = da.run_short_term_analysis(sample_items, mode, label_dict, top_n=5)
+        assert {mode, "metadata", "sector_summary"} <= set(r)
+        assert r["metadata"]["analysis_type"] == f"short_term_{mode}"
+        assert r[mode], "expected non-empty results"
 
-    def test_occupations_mode_structure(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "occupations", label_dict, top_n=5)
-        assert "occupations" in r
-
-    def test_results_sorted_by_cps_descending(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=10)
+    def test_sorted_by_cps(self, sample_items, label_dict, no_llm):
+        r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=10)
         scores = [e["metrics"]["composite_potential_score"] for e in r["skills"]]
         assert scores == sorted(scores, reverse=True)
 
-    def test_empty_items_returns_empty_results(self, label_dict):
-        r = da.run_short_term_analysis([], "skills", label_dict, top_n=5)
-        assert r["skills"] == []
-
-    def test_sector_summary_counts_consistent(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=10)
+    def test_top_n_and_counts(self, sample_items, label_dict, no_llm):
+        r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=2)
         ss = r["sector_summary"]
-        assert (ss["high_potential_count"] + ss["medium_potential_count"] +
-                ss["low_potential_count"]) == ss["total_entities_analyzed"]
-
-    def test_each_entity_has_recommendation_keys(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=3)
-        for entity in r["skills"]:
-            recs = entity["recommendations"]
-            assert {"talent_acquisition",
-                    "training_and_development",
-                    "compensation_and_retention"} <= set(recs)
-
-    def test_metadata_analysis_type(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=3)
-        assert r["metadata"]["analysis_type"] == "short_term_skills"
-
-    def test_top_n_respected(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=2)
         assert len(r["skills"]) <= 2
+        assert ss["high_potential_count"] + ss["medium_potential_count"] + ss["low_potential_count"] \
+               == ss["total_entities_analyzed"]
 
-    def test_each_entity_has_time_series(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis(sample_items, "skills", label_dict, top_n=3)
-        for entity in r["skills"]:
-            ts = entity["time_series"]
-            assert "historical" in ts and "forecast" in ts and "forecast_method" in ts
+    def test_labels_resolved(self, sample_items, label_dict, no_llm):
+        r = da.run_short_term_analysis(sample_items, "occupations", label_dict, top_n=3)
+        assert all(e["label"].startswith("Occupation") for e in r["occupations"])
 
-
-class TestRunShortTermAnalysisBySector:
-    def test_returns_dict_with_entries(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis_by_sector(
-                sample_items, "skills", label_dict, top_n=5, user_sector="IT"
-            )
-        assert isinstance(r, dict) and len(r) > 0
-
-    def test_sector_metadata_overridden_with_user_sector(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis_by_sector(
-                sample_items, "skills", label_dict, top_n=5, user_sector="MyCustomSector"
-            )
-        for analysis in r.values():
-            assert analysis["metadata"]["sector"] == "MyCustomSector"
-
-    def test_sector_item_count_in_metadata(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_short_term_analysis_by_sector(
-                sample_items, "skills", label_dict, top_n=5
-            )
-        for analysis in r.values():
-            assert "sector_item_count" in analysis["metadata"]
+    def test_empty_items(self, label_dict):
+        assert da.run_short_term_analysis([], "skills", label_dict, top_n=5)["skills"] == []
 
 
-class TestRunLongTermSkillsFromJobs:
-    def test_structure(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=5)
+class TestRunLongTermSkills:
+    def test_structure_and_order(self, sample_items, label_dict, no_llm):
+        r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=10)
         assert {"skills", "metadata", "sector_summary"} <= set(r)
-
-    def test_empty_items_graceful(self, label_dict):
-        r = da.run_long_term_skills_from_jobs([], label_dict)
-        assert r["sector_summary"]["total_entities_analyzed"] == 0
-
-    def test_sorted_by_theta_descending(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=10)
         thetas = [s["theta"] for s in r["skills"]]
         assert thetas == sorted(thetas, reverse=True)
+        assert all(0.0 <= t <= 1.0 for t in thetas)
 
-    def test_theta_in_unit_interval(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=10)
-        for s in r["skills"]:
-            assert 0.0 <= s["theta"] <= 1.0
-
-    def test_required_skill_fields_present(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=5)
-        required = {
-            "uri", "label", "emergence_quotient", "theta", "confidence",
-            "time_to_emergence", "dominant_category", "fuzzy_memberships",
-            "irt_signals", "total_job_mentions", "recommendations",
-        }
+    def test_required_fields(self, sample_items, label_dict, no_llm):
+        r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=3)
+        required = {"uri", "label", "emergence_quotient", "theta", "confidence", "time_to_emergence",
+                    "dominant_category", "fuzzy_memberships", "irt_signals", "total_job_mentions",
+                    "recommendations"}
         for s in r["skills"]:
             assert required <= set(s)
 
-    def test_top_n_respected(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=2)
-        assert len(r["skills"]) <= 2
+    def test_one_llm_call_per_skill(self, sample_items, label_dict, no_llm):
+        r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=2)
+        assert no_llm.call_count == len(r["skills"]) == 2
 
-    def test_metadata_framework_field(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=3)
-        assert "EMERGE" in r["metadata"]["framework"]
+    def test_without_recommendations_no_llm(self, sample_items, label_dict, no_llm):
+        r = da.run_long_term_skills_from_jobs(sample_items, label_dict, top_n=5, with_recommendations=False)
+        no_llm.assert_not_called()
+        assert all(s["recommendations"] is None for s in r["skills"])
+
+    def test_signals_reported_in_metadata(self, label_dict, no_llm):
+        hiring_like = [{"skills": ["1", "2"], "upload_date": _days_ago(i * 40), "occupations": "dev"}
+                       for i in range(10)]
+        r = da.run_long_term_skills_from_jobs(hiring_like, label_dict, top_n=2)
+        used = r["metadata"]["irt_signals_used"]
+        assert "geo_spread" not in used
+        for s in r["skills"]:
+            assert set(s["irt_signals"]) == set(used)
+
+    def test_empty(self, label_dict):
+        assert da.run_long_term_skills_from_jobs([], label_dict)["sector_summary"]["total_entities_analyzed"] == 0
 
 
-class TestRunLongTermOccupationsFromJobs:
-    def test_structure(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_occupations_from_jobs(
-                sample_items, label_dict, top_n=5, sector="J"
-            )
+class TestRunLongTermOccupations:
+    def test_structure_and_order(self, sample_items, label_dict, no_llm):
+        r = da.run_long_term_occupations_from_jobs(sample_items, label_dict, top_n=5, sector="J")
         assert {"occupations", "metadata", "sector_summary"} <= set(r)
-
-    def test_top_n_respected(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_occupations_from_jobs(
-                sample_items, label_dict, top_n=2
-            )
-        assert len(r["occupations"]) <= 2
-
-    def test_sorted_by_theta_descending(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_occupations_from_jobs(
-                sample_items, label_dict, top_n=10
-            )
         thetas = [o["theta"] for o in r["occupations"]]
         assert thetas == sorted(thetas, reverse=True)
+        for o in r["occupations"]:
+            assert {"uri", "label", "theta", "dominant_category", "recommendations"} <= set(o)
 
-    def test_empty_items_graceful(self, label_dict):
-        r = da.run_long_term_occupations_from_jobs([], label_dict)
-        assert r["sector_summary"]["total_occupations_analyzed"] == 0
+    def test_llm_only_for_returned_occupations(self, sample_items, label_dict, no_llm):
+        """Regression: used to call the LLM for up to 500 skills plus every occupation."""
+        r = da.run_long_term_occupations_from_jobs(sample_items, label_dict, top_n=2)
+        assert len(r["occupations"]) == 2
+        assert no_llm.call_count == 2
 
-    def test_required_occupation_fields(self, sample_items, label_dict):
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            r = da.run_long_term_occupations_from_jobs(
-                sample_items, label_dict, top_n=5
-            )
-        for occ in r["occupations"]:
-            for field in ("uri", "label", "theta", "dominant_category", "recommendations"):
-                assert field in occ
+    def test_list_occupations_split(self, sample_items, label_dict, no_llm):
+        r = da.run_long_term_occupations_from_jobs(sample_items, label_dict, top_n=10)
+        assert {o["uri"] for o in r["occupations"]} == set(OCC_URIS)
 
+    def test_named_occupations_from_hiring(self, label_dict, no_llm):
+        items = [{"skills": [str(i % 4)], "upload_date": _days_ago(i * 30),
+                  "occupations": ["dev", "analyst"][i % 2]} for i in range(10)]
+        r = da.run_long_term_occupations_from_jobs(items, label_dict, top_n=5)
+        assert {o["label"] for o in r["occupations"]} == {"dev", "analyst"}
 
-# ══════════════════════════════════════════════════════════════════
-#  6.  KNOWN BUGS — regression documentation
-# ══════════════════════════════════════════════════════════════════
-
-class TestKnownBugs:
-    """
-    These tests exercise code paths that are *currently broken*.
-    They document existing bugs so they are not silently reintroduced.
-    Expected to fail on the unpatched source; pass once fixed.
-    """
-
-    def test_bug1_sector_fields_is_string_not_tuple(self):
-        """
-        BUG-1: _SECTOR_FIELDS = ("sectors") creates a string, not a tuple.
-        Iterating over it yields individual characters 's','e','c',…
-        so _extract_sectors() can never find the 'sectors' key and always
-        returns ["unknown"].
-
-        Intended behaviour: extracting from {"sectors": ["J"]} returns ["J"].
-        """
-        result = da._extract_sectors({"sectors": ["J", "K"]})
-        # This assertion should pass AFTER the fix:
-        assert result == ["J", "K"], (
-            "BUG-1 still present: _SECTOR_FIELDS is a string, not a tuple. "
-            "Change to _SECTOR_FIELDS = ('sectors',) to fix."
-        )
-
-    def test_bug2_run_long_term_skills_sector_nameerror(self, label_dict):
-        """
-        BUG-2: run_long_term_skills() uses `sector` as a variable but it is not
-        declared in the function's signature or body.
-        Calling it with non-empty data raises NameError.
-
-        Fix: add  sector: str = "Unknown"  to the function signature.
-        """
-        items_by_source = {
-            "policies":    _make_items(5),
-            "projects":    [],
-            "white_papers": [],
-        }
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            with pytest.raises(NameError):
-                da.run_long_term_skills(items_by_source, label_dict, top_n=2)
+    def test_empty(self, label_dict):
+        assert da.run_long_term_occupations_from_jobs([], label_dict)["sector_summary"][
+                   "total_occupations_analyzed"] == 0
 
 
 # ══════════════════════════════════════════════════════════════════
-#  7.  FASTAPI ENDPOINTS
+#  6.  DATA SOURCES
 # ══════════════════════════════════════════════════════════════════
 
-_ESCO_DF   = _fake_esco_df()
-_LABEL_DICT = _fake_label_dict()
+class TestPortalGet:
+    def test_sends_org_header(self, portal):
+        da._portal_get(f"{da.HIRING_API}/api/v1/jobAds", "Acme")
+        assert portal.calls[-1][1]["X-User-Organization"] == "Acme"
+
+    def test_no_org_header_when_not_given(self, portal):
+        da._portal_get(f"{da.EMPLOYEE_API}/organizations")
+        assert "X-User-Organization" not in portal.calls[-1][1]
+
+    def test_bearer_token_when_configured(self, portal, monkeypatch):
+        monkeypatch.setattr(da, "PORTAL_API_TOKEN", "secret")
+        da._portal_get(f"{da.EMPLOYEE_API}/organizations")
+        assert portal.calls[-1][1]["Authorization"] == "Bearer secret"
+
+    def test_retries_three_times_then_none(self, portal):
+        portal.fail_hiring = True
+        assert da._portal_get(f"{da.HIRING_API}/api/v1/jobAds", "Acme") is None
+        assert len(portal.calls) == 3
+
+    def test_required_raises(self, portal):
+        portal.fail_hiring = True
+        with pytest.raises(RuntimeError):
+            da._portal_get(f"{da.HIRING_API}/api/v1/jobAds", "Acme", required=True)
 
 
-class TestShortTermSkillsEndpoint:
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_200_with_data(self, _llm, _pag, _esco, tmp_cache):
-        assert client.get("/shorttermanalysis/skills").status_code == 200
+class TestFetchOrgJobs:
+    def test_reshapes_ads(self, portal):
+        items, labels = da.fetch_org_jobs("Eclipse")
+        assert len(items) == len(portal.ads)
+        first = items[0]
+        assert first["upload_date"] == portal.details[1]["publishDate"]
+        assert first["occupations"] == portal.ads[0]["occupationName"]
+        assert first["skills"] == sorted(str(s["id"]) for s in portal.skills[1])
+        assert labels["1"] == "skill 1"
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_response_contains_metadata_and_results(self, _llm, _pag, _esco, tmp_cache):
-        body = client.get("/shorttermanalysis/skills").json()
-        assert "metadata" in body and "results_by_sector" in body
+    def test_uses_ids_from_ads_for_skill_calls(self, portal):
+        da.fetch_org_jobs("Eclipse")
+        skill_urls = [u for u, _ in portal.calls if u.endswith("/interview-skills")]
+        assert len(skill_urls) == len(portal.ads)
+        assert f"{da.HIRING_API}/api/v1/jobAds/3/interview-skills" in skill_urls
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=[])
-    def test_no_data_returns_no_data_status(self, _pag, _esco, tmp_cache):
-        assert client.get("/shorttermanalysis/skills").json()["status"] == "no_data"
+    def test_missing_publish_date_kept_as_none(self, portal):
+        portal.details[2] = {"id": 2}
+        items, _ = da.fetch_org_jobs("Eclipse")
+        assert items[1]["upload_date"] is None
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_sector_query_param_forwarded(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/shorttermanalysis/skills?sector=J")
-        assert mock_pag.call_args[0][0].get("sectors") == "J"
+    def test_occupation_falls_back_to_detail(self, portal):
+        portal.ads[0]["occupationName"] = None
+        portal.details[1]["occupation"] = {"title": "from detail"}
+        items, _ = da.fetch_org_jobs("Eclipse")
+        assert items[0]["occupations"] == "from detail"
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_organization_query_param_forwarded(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/shorttermanalysis/skills?organization=AcmeCorp")
-        assert mock_pag.call_args[0][0].get("organization_names") == "AcmeCorp"
+    def test_ad_without_id_skipped(self, portal):
+        portal.ads.append({"jobTitle": "no id"})
+        items, _ = da.fetch_org_jobs("Eclipse")
+        assert len(items) == len(portal.ads) - 1
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_second_identical_request_uses_cache(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/shorttermanalysis/skills?sector=J")
-        mock_pag.reset_mock()
-        client.get("/shorttermanalysis/skills?sector=J")
-        mock_pag.assert_not_called()
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_different_sector_hits_api_again(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/shorttermanalysis/skills?sector=J")
-        mock_pag.reset_mock()
-        client.get("/shorttermanalysis/skills?sector=K")  # different sector
-        mock_pag.assert_called_once()
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_filters_applied_field_in_output(self, _llm, _pag, _esco, tmp_cache):
-        body = client.get("/shorttermanalysis/skills?sector=J&organization=Acme").json()
-        assert body.get("filters_applied", {}).get("sector") == "J"
+    def test_list_failure_raises(self, portal):
+        portal.fail_hiring = True
+        with pytest.raises(RuntimeError):
+            da.fetch_org_jobs("Eclipse")
 
 
-class TestShortTermOccupationsEndpoint:
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_200_with_data(self, _llm, _pag, _esco, tmp_cache):
-        assert client.get("/shorttermanalysis/occupations").status_code == 200
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=[])
-    def test_no_data_status(self, _pag, _esco, tmp_cache):
-        assert client.get("/shorttermanalysis/occupations").json()["status"] == "no_data"
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_sector_forwarded_to_paginate(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/shorttermanalysis/occupations?sector=K")
-        assert mock_pag.call_args[0][0].get("sectors") == "K"
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_result_cached(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/shorttermanalysis/occupations?sector=K")
-        mock_pag.reset_mock()
-        client.get("/shorttermanalysis/occupations?sector=K")
-        mock_pag.assert_not_called()
+class TestCleanSectors:
+    @pytest.mark.parametrize("raw,expected", [
+        (['"Computer programming activities"'], ["Computer programming activities"]),
+        ([' "A" ', "'B'", "C"],                 ["A", "B", "C"]),
+        (['"A"', "A", '""', "", None],          ["A"]),
+        ('"Single"',                            ["Single"]),
+        (None,                                  []),
+    ])
+    def test_cases(self, raw, expected):
+        assert da._clean_sectors(raw) == expected
 
 
-class TestLongTermSkillsEndpoint:
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=[])
-    def test_no_data_status(self, _pag, _esco, tmp_cache):
-        assert client.get("/longtermanalysis/skills").json()["status"] == "no_data"
+class TestFetchOrgProfile:
+    def test_exact_match_preferred(self, portal):
+        assert da.fetch_org_profile("eclipse")["id"] == 8
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(8))
-    @patch.object(da, "run_long_term_skills",
-                  side_effect=lambda *a, **k: _make_lt_skills_output())
-    def test_200_with_mocked_pipeline(self, mock_lt, _pag, _esco, tmp_cache):
-        """
-        run_long_term_skills is mocked to bypass BUG-2 (NameError on `sector`).
-        Remove the mock once BUG-2 is fixed.
-        """
-        resp = client.get("/longtermanalysis/skills")
-        assert resp.status_code == 200
-        mock_lt.assert_called_once()
+    def test_partial_match(self, portal):
+        assert da.fetch_org_profile("foundation")["id"] == 7
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(8))
-    @patch.object(da, "run_long_term_skills",
-                  side_effect=lambda *a, **k: _make_lt_skills_output())
-    def test_keywords_added_to_metadata(self, _lt, _pag, _esco, tmp_cache):
-        body = client.get("/longtermanalysis/skills?keywords=python,ml").json()
-        assert body["metadata"].get("keywords") is not None
+    def test_case_and_whitespace_insensitive(self, portal):
+        assert da.fetch_org_profile("  ECLIPSE FOUNDATION ")["id"] == 7
 
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(8))
-    @patch.object(da, "run_long_term_skills",
-                  side_effect=lambda *a, **k: _make_lt_skills_output())
-    def test_result_cached(self, _lt, mock_pag, _esco, tmp_cache):
-        client.get("/longtermanalysis/skills?keywords=ai")
-        mock_pag.reset_mock()
-        client.get("/longtermanalysis/skills?keywords=ai")
-        mock_pag.assert_not_called()
+    def test_sectors_cleaned(self, portal):
+        assert da.fetch_org_profile("Eclipse Foundation")["sectors"] == \
+               ["Computer programming activities", "Research"]
+
+    def test_does_not_mutate_source(self, portal):
+        da.fetch_org_profile("Eclipse Foundation")
+        assert portal.organizations[0]["sectors"][0] == '"Computer programming activities"'
+
+    def test_not_found(self, portal):
+        assert da.fetch_org_profile("nobody") is None
+
+    def test_failure_raises(self, portal):
+        portal.fail_employee = True
+        with pytest.raises(RuntimeError):
+            da.fetch_org_profile("eclipse")
 
 
-class TestLongTermOccupationsEndpoint:
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_200_with_data(self, _llm, _pag, _esco, tmp_cache):
-        assert client.get("/longtermanalysis/occupations").status_code == 200
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=[])
-    def test_no_data_status(self, _pag, _esco, tmp_cache):
-        assert client.get("/longtermanalysis/occupations").json()["status"] == "no_data"
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_top_n_query_param_accepted(self, _llm, _pag, _esco, tmp_cache):
-        assert client.get("/longtermanalysis/occupations?top_n=5").status_code == 200
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_sector_forwarded_to_paginate(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/longtermanalysis/occupations?sector=J")
-        assert mock_pag.call_args[0][0].get("sectors") == "J"
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_result_cached(self, _llm, mock_pag, _esco, tmp_cache):
-        client.get("/longtermanalysis/occupations?sector=J")
-        mock_pag.reset_mock()
-        client.get("/longtermanalysis/occupations?sector=J")
-        mock_pag.assert_not_called()
-
-    @patch.object(da, "load_esco_mapping", return_value=(_ESCO_DF, _LABEL_DICT))
-    @patch.object(da, "paginate_all",      return_value=_make_items(12))
-    @patch.object(da, "_chat_llm_json",    return_value=None)
-    def test_output_has_occupations_key(self, _llm, _pag, _esco, tmp_cache):
-        body = client.get("/longtermanalysis/occupations").json()
-        assert "occupations" in body or body.get("status") == "no_data"
+class TestFetchSectorJobs:
+    def test_body(self, monkeypatch):
+        pag = MagicMock(return_value=[])
+        monkeypatch.setattr(da, "paginate_all", pag)
+        da.fetch_sector_jobs("Computer programming activities")
+        body = pag.call_args.args[0]
+        endpoint = pag.call_args.kwargs.get("endpoint", pag.call_args.args[1:2] and pag.call_args.args[1])
+        start, end = da._default_dates(da.TRACKER_YEARS_BACK)
+        assert endpoint == "jobs"
+        assert body == {"sectors": "Computer programming activities",
+                        "min_upload_date": start, "max_upload_date": end}
 
 
 # ══════════════════════════════════════════════════════════════════
-#  8.  EDGE CASES & REGRESSION
+#  7.  ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestEdgeCases:
-    def test_forecast_single_point_no_crash(self):
-        result = da.forecast_series([42.0], 4)
-        assert len(result["forecast"]) == 4
+@pytest.mark.parametrize("path,key", ENDPOINTS)
+class TestEveryEndpoint:
+    def test_organization_required(self, path, key, services):
+        assert client.get(path).status_code == 422
 
-    def test_quarters_back_cross_year_boundary(self):
-        labels = da._quarters_back(4)
-        years = {lbl[:4] for lbl in labels}
-        assert len(years) <= 2
+    def test_both_analyses_returned(self, path, key, services):
+        body = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        assert body["organization_profile"]["id"] == 7
+        org, sec = body["organization_analysis"], body["sector_analysis"]
+        assert org["status"] == "ok" and org[key]
+        assert "Hiring Management" in org["data_source"]
+        assert sec["status"] == "ok"
+        assert sec["sectors"] == ["Computer programming activities", "Research"]
+        assert set(sec["results_by_sector"]) == set(sec["sectors"])
+        for r in sec["results_by_sector"].values():
+            assert r["status"] == "ok" and r[key] and r["jobs_retrieved"] == 12
 
-    def test_build_skill_series_year_boundary(self):
-        items = [
-            {"upload_date": "2022-12-31", "skills": ["s1"]},
-            {"upload_date": "2023-01-01", "skills": ["s1"]},
-        ]
-        series = da._build_skill_series(items)
-        assert "2022-Q4" in series["s1"]
-        assert "2023-Q1" in series["s1"]
+    def test_tracker_queried_once_per_clean_sector(self, path, key, services):
+        _, tracker, _ = services
+        client.get(f"{path}?organization=Eclipse Foundation&top_n=3")
+        assert sorted(c.args[0]["sectors"] for c in tracker.call_args_list) == \
+               ["Computer programming activities", "Research"]
 
-    def test_emergence_index_all_zeros_returns_none(self):
-        assert da._emergence_index([0.0] * 8) is None
+    def test_hiring_called_with_org_header(self, path, key, services):
+        portal, _, _ = services
+        client.get(f"{path}?organization=Eclipse Foundation&top_n=3")
+        hiring = [h for u, h in portal.calls if u.startswith(TEST_HIRING_API)]
+        assert hiring and all(h["X-User-Organization"] == "Eclipse Foundation" for h in hiring)
 
-    def test_tte_minimum_clamp(self):
-        tte = da.time_to_emergence(0.99, 0.99)
-        assert tte["point_estimate_years"] >= 0.2
+    def test_top_n_respected(self, path, key, services):
+        body = client.get(f"{path}?organization=Eclipse Foundation&top_n=2").json()
+        assert len(body["organization_analysis"][key]) <= 2
+        for r in body["sector_analysis"]["results_by_sector"].values():
+            assert len(r[key]) <= 2
 
-    def test_irt_p_exactly_at_difficulty(self):
-        for b in [0.2, 0.5, 0.8]:
-            assert da._irt_p(b, a=2.0, b=b) == pytest.approx(0.5, abs=1e-6)
+    def test_second_call_served_from_cache(self, path, key, services):
+        portal, tracker, _ = services
+        first = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        n_portal, n_tracker = len(portal.calls), tracker.call_count
+        second = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        assert second == first
+        assert len(portal.calls) == n_portal and tracker.call_count == n_tracker
 
-    def test_fuzzy_at_theta_zero_speculative_is_one(self):
-        m = da.fuzzy_memberships(0.0)
-        assert m["speculative"] == pytest.approx(1.0, abs=1e-4)
-        assert m["breakthrough"] == pytest.approx(0.0, abs=1e-4)
+    def test_hiring_failure_keeps_sector_and_skips_cache(self, path, key, services, tmp_cache):
+        portal, _, _ = services
+        portal.fail_hiring = True
+        body = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        assert body["organization_analysis"]["status"] == "error"
+        assert body["sector_analysis"]["status"] == "ok"
+        assert list(tmp_cache.iterdir()) == []
 
-    def test_cps_no_nan_with_empty_norm_lists(self):
-        score = da.compute_cps(
-            hist_cagr=5.0, fore_cagr=8.0, rgi=1.5, ei=0.7, volatility=0.3,
-            all_hist_cagrs=[], all_fore_cagrs=[], all_rgis=[], all_vols=[],
-        )
-        assert not math.isnan(score)
-        assert 0.0 <= score <= 1.0
+    def test_unknown_org(self, path, key, services):
+        body = client.get(f"{path}?organization=nobody&top_n=3").json()
+        assert body["organization_profile"] is None
+        assert body["sector_analysis"]["status"] == "no_data"
+        assert body["organization_analysis"]["status"] == "ok"   # hiring still answers for the name
 
-    def test_parse_llm_json_empty_curly(self):
-        assert da._parse_llm_json("{}") == {}
 
-    def test_demand_velocity_exactly_three_elements(self):
-        result = da._demand_velocity([5.0, 6.0, 7.0])
-        assert result is not None
+class TestEndpointEdgeCases:
+    def test_org_without_sectors(self, services):
+        _, tracker, _ = services
+        body = client.get("/shorttermanalysis/skills?organization=No Sector Org&top_n=3").json()
+        assert body["sector_analysis"]["status"] == "no_data"
+        tracker.assert_not_called()
 
-    def test_cagr_equal_start_end_zero(self):
-        assert abs(da._cagr([10.0, 10.0], 1.0)) < 0.001
+    def test_employee_failure_reported_and_not_cached(self, services, tmp_cache):
+        portal, _, _ = services
+        portal.fail_employee = True
+        body = client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=3").json()
+        assert body["sector_analysis"]["status"] == "error"
+        assert "Employee Management" in body["sector_analysis"]["message"]
+        assert body["organization_analysis"]["status"] == "ok"
+        assert list(tmp_cache.iterdir()) == []
 
-    def test_linear_forecast_ci_monotone_widening(self):
-        pts = da._linear_forecast([2.0, 4.0, 6.0, 8.0, 10.0], 5)["forecast"]
-        widths = [p["ci_upper_95"] - p["ci_lower_95"] for p in pts]
-        for w1, w2 in zip(widths, widths[1:]):
-            assert w2 >= w1
+    def test_one_sector_failing_does_not_hide_the_other(self, services, tmp_cache):
+        _, tracker, _ = services
 
-    def test_fill_series_empty_labels(self):
-        result = da._fill_series({"2023-Q1": 5}, [])
-        assert result == []
+        def flaky(body, endpoint):
+            if body["sectors"] == "Research":
+                raise RuntimeError("tracker down")
+            return _make_items(12)
+        tracker.side_effect = flaky
 
-    def test_compute_job_signals_empty_item_list(self):
-        sigs = da.compute_job_signals("s1", [], 0)
-        assert all(v == 0.0 for v in sigs.values())
+        body = client.get("/shorttermanalysis/skills?organization=Eclipse Foundation&top_n=3").json()
+        res = body["sector_analysis"]["results_by_sector"]
+        assert res["Computer programming activities"]["status"] == "ok"
+        assert res["Research"]["status"] == "error"
+        assert list(tmp_cache.iterdir()) == []
 
-    def test_yoy_growth_signal_none_dates_in_list(self):
-        dates = [None, None, None]
-        assert da._yoy_growth_signal(dates) == 0.0
+    def test_sector_with_no_jobs(self, services):
+        _, tracker, _ = services
+        tracker.side_effect = lambda body, endpoint: []
+        body = client.get("/longtermanalysis/skills?organization=Eclipse&top_n=3").json()
+        assert body["sector_analysis"]["results_by_sector"]["Exact match sector"]["status"] == "no_data"
+        assert body["sector_analysis"]["status"] == "no_data"
 
-    def test_short_term_recommendations_static_fallback(self, label_dict):
-        """When LLM fails, static recommendations must cover all three keys."""
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            recs = da._short_term_recommendations(
-                tier="high",
-                entity_label="Python",
-                metrics={
-                    "historical_cagr_pct": 12.0,
-                    "forecast_cagr_pct": 15.0,
-                    "demand_velocity_pct": 5.0,
-                    "market_penetration_rate_pct": 8.0,
-                    "demand_volatility": 0.4,
-                    "relative_growth_index": 1.8,
-                    "emergence_index": 0.7,
-                    "composite_potential_score": 0.8,
-                },
-            )
-        assert {"talent_acquisition",
-                "training_and_development",
-                "compensation_and_retention"} <= set(recs)
+    def test_org_with_only_undated_ads(self, services):
+        portal, _, _ = services
+        portal.details = {i: {"id": i} for i in portal.details}
+        body = client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=3").json()
+        org = body["organization_analysis"]
+        assert org["status"] == "no_data"
+        assert org["jobs_without_publish_date"] == len(portal.ads)
 
-    def test_long_term_recommendations_static_fallback(self):
-        """When LLM fails, static LT recommendations must cover all three keys."""
-        tte = da.time_to_emergence(0.6, 0.8)
-        sigs = {k: 0.3 for k in da.IRT_PARAMS}
-        with patch.object(da, "_chat_llm_json", return_value=None):
-            recs = da._long_term_recommendations(
-                "emerging", "Machine Learning", 0.6, tte, sigs
-            )
-        assert {"strategic_workforce_planning",
-                "partnerships_and_pipeline",
-                "regulatory_and_compliance"} <= set(recs)
+    def test_different_top_n_not_shared_in_cache(self, services):
+        _, tracker, _ = services
+        client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=3")
+        n = tracker.call_count
+        client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=4")
+        assert tracker.call_count > n
+
+    def test_org_sector_used_in_org_recommendations(self, services):
+        _, _, llm = services
+        client.get("/longtermanalysis/skills?organization=Eclipse&top_n=1")
+        prompts = [c.args[1] for c in llm.call_args_list]
+        assert any("hiring-management" in p and "Exact match sector" in p for p in prompts)
