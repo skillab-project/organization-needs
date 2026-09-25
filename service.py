@@ -138,7 +138,7 @@ app = FastAPI(
     title="SKILLAB Demand Analysis API",
     description="Short-term and long-term skill/occupation demand analysis for US #23 and US #24.",
     version="1.0.0",
-    # root_path="/demand_analysis",  # uncomment when running behind a proxy
+    root_path=os.getenv("ROOT_PATH", ""),
 )
 
 FOLDER = Path("completed_anlyses5")
