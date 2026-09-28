@@ -8,8 +8,8 @@ services:
     environment:
       - TRACKER_API=https://skillab-tracker.csd.auth.gr/api
       - LLM_API_URL=http://160.40.52.27:3000
-      - HIRING_API=http://portal.skillab-project.eu/hiring-management
-      - EMPLOYEE_API=http://portal.skillab-project.eu/employee-management
+      - HIRING_API=http://hiring-management-backend:8080
+      - EMPLOYEE_API=http://employee-management-backend:8001
     ports:
       - "8871:8000"
     volumes:
