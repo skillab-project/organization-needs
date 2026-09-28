@@ -8,13 +8,21 @@ services:
     environment:
       - TRACKER_API=https://skillab-tracker.csd.auth.gr/api
       - LLM_API_URL=http://160.40.52.27:3000
+      - HIRING_API=http://portal.skillab-project.eu/hiring-management
+      - EMPLOYEE_API=http://portal.skillab-project.eu/employee-management
     ports:
       - "8871:8000"
     volumes:
       - organization-needs_anlyses:/app/completed_anlyses
+    networks:
+      - shared-net
     labels:
       io.portainer.accesscontrol.teams: skillab-all
     restart: unless-stopped
+
+networks:
+  shared-net:
+    external: true
 
 volumes:
   organization-needs_anlyses:
