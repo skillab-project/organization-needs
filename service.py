@@ -2,7 +2,7 @@
 demand_analysis.py
 ==================
 SKILLAB — Demand Analysis Service
-Endpoints (all take ?organization=<name>):
+Endpoints (all take the organization name in the X-User-Organization header):
   GET /shorttermanalysis/skills       — US #23  Short-term skill demand
   GET /shorttermanalysis/occupations  — US #24  Short-term occupation demand
   GET /longtermanalysis/skills        — US #23  Long-term skill emergence (EMERGE, job-based)
@@ -26,7 +26,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, Query
 import pandas as pd
 import requests as req
 import os
@@ -141,7 +141,7 @@ app = FastAPI(
     root_path=os.getenv("ROOT_PATH", ""),
 )
 
-FOLDER = Path("completed_anlyses5")
+FOLDER = Path("completed_anlyses")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1649,7 +1649,7 @@ def _run_combined(endpoint: str, organization: str, top_n: int, analyze: Analysi
 
 @app.get("/shorttermanalysis/skills")
 def short_term_skills(
-    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
@@ -1662,7 +1662,7 @@ def short_term_skills(
 
 @app.get("/shorttermanalysis/occupations")
 def short_term_occupations(
-    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
@@ -1675,7 +1675,7 @@ def short_term_occupations(
 
 @app.get("/longtermanalysis/skills")
 def long_term_skills(
-    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
@@ -1687,7 +1687,7 @@ def long_term_skills(
 
 @app.get("/longtermanalysis/occupations")
 def long_term_occupations(
-    organization: str = Query(..., description="Organization name, e.g. 'eclipse'."),
+    organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):

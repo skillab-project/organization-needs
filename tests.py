@@ -4,7 +4,7 @@ test_demand_analysis.py
 Pytest suite for the SKILLAB Demand Analysis service
 =====================================================================
 
-Every endpoint takes ?organization=<name> and returns two analyses:
+Every endpoint takes the X-User-Organization header and returns two analyses:
   organization_analysis — job ads from the Hiring Management API
   sector_analysis       — sectors from the Employee Management API,
                           then job postings per sector from the SKILLAB Tracker
@@ -832,8 +832,11 @@ class TestEveryEndpoint:
     def test_organization_required(self, path, key, services):
         assert client.get(path).status_code == 422
 
+    def test_organization_query_param_not_accepted(self, path, key, services):
+        assert client.get(f"{path}?organization=Eclipse&top_n=3").status_code == 422
+
     def test_both_analyses_returned(self, path, key, services):
-        body = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        body = client.get(f"{path}?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"}).json()
         assert body["organization_profile"]["id"] == 7
         org, sec = body["organization_analysis"], body["sector_analysis"]
         assert org["status"] == "ok" and org[key]
@@ -846,40 +849,40 @@ class TestEveryEndpoint:
 
     def test_tracker_queried_once_per_clean_sector(self, path, key, services):
         _, tracker, _ = services
-        client.get(f"{path}?organization=Eclipse Foundation&top_n=3")
+        client.get(f"{path}?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"})
         assert sorted(c.args[0]["sectors"] for c in tracker.call_args_list) == \
                ["Computer programming activities", "Research"]
 
     def test_hiring_called_with_org_header(self, path, key, services):
         portal, _, _ = services
-        client.get(f"{path}?organization=Eclipse Foundation&top_n=3")
+        client.get(f"{path}?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"})
         hiring = [h for u, h in portal.calls if u.startswith(TEST_HIRING_API)]
         assert hiring and all(h["X-User-Organization"] == "Eclipse Foundation" for h in hiring)
 
     def test_top_n_respected(self, path, key, services):
-        body = client.get(f"{path}?organization=Eclipse Foundation&top_n=2").json()
+        body = client.get(f"{path}?top_n=2", headers={"X-User-Organization": "Eclipse Foundation"}).json()
         assert len(body["organization_analysis"][key]) <= 2
         for r in body["sector_analysis"]["results_by_sector"].values():
             assert len(r[key]) <= 2
 
     def test_second_call_served_from_cache(self, path, key, services):
         portal, tracker, _ = services
-        first = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        first = client.get(f"{path}?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"}).json()
         n_portal, n_tracker = len(portal.calls), tracker.call_count
-        second = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        second = client.get(f"{path}?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"}).json()
         assert second == first
         assert len(portal.calls) == n_portal and tracker.call_count == n_tracker
 
     def test_hiring_failure_keeps_sector_and_skips_cache(self, path, key, services, tmp_cache):
         portal, _, _ = services
         portal.fail_hiring = True
-        body = client.get(f"{path}?organization=Eclipse Foundation&top_n=3").json()
+        body = client.get(f"{path}?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"}).json()
         assert body["organization_analysis"]["status"] == "error"
         assert body["sector_analysis"]["status"] == "ok"
         assert list(tmp_cache.iterdir()) == []
 
     def test_unknown_org(self, path, key, services):
-        body = client.get(f"{path}?organization=nobody&top_n=3").json()
+        body = client.get(f"{path}?top_n=3", headers={"X-User-Organization": "nobody"}).json()
         assert body["organization_profile"] is None
         assert body["sector_analysis"]["status"] == "no_data"
         assert body["organization_analysis"]["status"] == "ok"   # hiring still answers for the name
@@ -888,14 +891,14 @@ class TestEveryEndpoint:
 class TestEndpointEdgeCases:
     def test_org_without_sectors(self, services):
         _, tracker, _ = services
-        body = client.get("/shorttermanalysis/skills?organization=No Sector Org&top_n=3").json()
+        body = client.get("/shorttermanalysis/skills?top_n=3", headers={"X-User-Organization": "No Sector Org"}).json()
         assert body["sector_analysis"]["status"] == "no_data"
         tracker.assert_not_called()
 
     def test_employee_failure_reported_and_not_cached(self, services, tmp_cache):
         portal, _, _ = services
         portal.fail_employee = True
-        body = client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=3").json()
+        body = client.get("/shorttermanalysis/skills?top_n=3", headers={"X-User-Organization": "Eclipse"}).json()
         assert body["sector_analysis"]["status"] == "error"
         assert "Employee Management" in body["sector_analysis"]["message"]
         assert body["organization_analysis"]["status"] == "ok"
@@ -910,7 +913,7 @@ class TestEndpointEdgeCases:
             return _make_items(12)
         tracker.side_effect = flaky
 
-        body = client.get("/shorttermanalysis/skills?organization=Eclipse Foundation&top_n=3").json()
+        body = client.get("/shorttermanalysis/skills?top_n=3", headers={"X-User-Organization": "Eclipse Foundation"}).json()
         res = body["sector_analysis"]["results_by_sector"]
         assert res["Computer programming activities"]["status"] == "ok"
         assert res["Research"]["status"] == "error"
@@ -919,27 +922,27 @@ class TestEndpointEdgeCases:
     def test_sector_with_no_jobs(self, services):
         _, tracker, _ = services
         tracker.side_effect = lambda body, endpoint: []
-        body = client.get("/longtermanalysis/skills?organization=Eclipse&top_n=3").json()
+        body = client.get("/longtermanalysis/skills?top_n=3", headers={"X-User-Organization": "Eclipse"}).json()
         assert body["sector_analysis"]["results_by_sector"]["Exact match sector"]["status"] == "no_data"
         assert body["sector_analysis"]["status"] == "no_data"
 
     def test_org_with_only_undated_ads(self, services):
         portal, _, _ = services
         portal.details = {i: {"id": i} for i in portal.details}
-        body = client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=3").json()
+        body = client.get("/shorttermanalysis/skills?top_n=3", headers={"X-User-Organization": "Eclipse"}).json()
         org = body["organization_analysis"]
         assert org["status"] == "no_data"
         assert org["jobs_without_publish_date"] == len(portal.ads)
 
     def test_different_top_n_not_shared_in_cache(self, services):
         _, tracker, _ = services
-        client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=3")
+        client.get("/shorttermanalysis/skills?top_n=3", headers={"X-User-Organization": "Eclipse"})
         n = tracker.call_count
-        client.get("/shorttermanalysis/skills?organization=Eclipse&top_n=4")
+        client.get("/shorttermanalysis/skills?top_n=4", headers={"X-User-Organization": "Eclipse"})
         assert tracker.call_count > n
 
     def test_org_sector_used_in_org_recommendations(self, services):
         _, _, llm = services
-        client.get("/longtermanalysis/skills?organization=Eclipse&top_n=1")
+        client.get("/longtermanalysis/skills?top_n=1", headers={"X-User-Organization": "Eclipse"})
         prompts = [c.args[1] for c in llm.call_args_list]
         assert any("hiring-management" in p and "Exact match sector" in p for p in prompts)
