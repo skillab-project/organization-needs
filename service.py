@@ -8,6 +8,12 @@ Endpoints (all take the organization name in the X-User-Organization header):
   GET /longtermanalysis/skills        — US #23  Long-term skill emergence (EMERGE, job-based)
   GET /longtermanalysis/occupations   — US #24  Long-term occupation emergence (EMERGE, job-based)
 
+Endpoints are asynchronous: the first call for a (endpoint, organization, top_n)
+combination starts the analysis in the background and returns 202 {"status": "started"}.
+Calling again with the same values returns 202 {"status": "in_progress"} while it runs,
+and the full result (200) once it has finished. A failed analysis is reported once
+({"status": "failed"}) and the next call starts it again.
+
 Every endpoint runs two analyses and returns both:
   organization_analysis — job ads of the organization from the Hiring Management API
   sector_analysis       — the organization's sectors are read from the Employee Management API,
@@ -19,6 +25,7 @@ import re
 import math
 import json
 import logging
+import threading
 import warnings
 import numpy as np
 from pathlib import Path
@@ -26,7 +33,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi import FastAPI, Header, Query
+from fastapi import BackgroundTasks, FastAPI, Header, Query, Response
 import pandas as pd
 import requests as req
 import os
@@ -211,20 +218,8 @@ def _ensure_folder() -> None:
     FOLDER.mkdir(parents=True, exist_ok=True)
 
 
-def _load_or_init_cache(file_path: str) -> Tuple[Optional[Any], bool]:
-    """
-    Returns (cached_data, already_exists).
-    If file does not exist, writes an in-progress stub and returns (None, False).
-    """
-    if os.path.exists(file_path):
-        log.info(f"Cache hit: {file_path}")
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f), True
-    log.info(f"Cache miss: {file_path} — initializing stub")
-    stub = {"status": "in_progress", "message": "Analysis is being computed", "result": None}
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(stub, f, indent=4, ensure_ascii=False)
-    return None, False
+def _in_progress_stub() -> Dict[str, Any]:
+    return {"status": "in_progress", "message": "Analysis is being computed", "result": None}
 
 
 def _save_cache(file_path: str, data: Any) -> None:
@@ -1595,101 +1590,156 @@ def _has_error(output: Dict) -> bool:
     )
 
 
-def _run_combined(endpoint: str, organization: str, top_n: int, analyze: AnalysisFn) -> Dict:
-    log.info("=" * 70)
-    log.info(f"[ENDPOINT] {endpoint} — organization={organization}, top_n={top_n}")
-    log.info("=" * 70)
-
-    _ensure_folder()
-    file_path = os.path.join(FOLDER, _build_cache_key(endpoint.strip("/").replace("/", "_"), organization, str(top_n)))
-
-    cached, exists = _load_or_init_cache(file_path)
-    if exists:
-        return cached
-
+def _compute_combined(endpoint: str, organization: str, analyze: AnalysisFn) -> Dict:
+    """Run both analyses (organization + sector) and return the combined output."""
     try:
-        try:
-            profile = fetch_org_profile(organization)
-            profile_error = None
-        except Exception as exc:
-            log.exception("[Employee] organization lookup failed")
-            profile, profile_error = None, str(exc)
+        profile = fetch_org_profile(organization)
+        profile_error = None
+    except Exception as exc:
+        log.exception("[Employee] organization lookup failed")
+        profile, profile_error = None, str(exc)
 
-        output = {
-            "metadata": {
-                "endpoint":      endpoint,
-                "organization":  organization,
-                "analysis_date": datetime.now().isoformat(),
-            },
-            "organization_profile":  profile,
-            "organization_analysis": _organization_part(organization, profile, analyze),
-            "sector_analysis":       _sector_part(organization, profile, analyze),
-        }
-        if profile_error:
-            output["sector_analysis"].update({"status": "error",
-                                              "message": f"Employee Management lookup failed: {profile_error}"})
+    output = {
+        "metadata": {
+            "endpoint":      endpoint,
+            "organization":  organization,
+            "analysis_date": datetime.now().isoformat(),
+        },
+        "organization_profile":  profile,
+        "organization_analysis": _organization_part(organization, profile, analyze),
+        "sector_analysis":       _sector_part(organization, profile, analyze),
+    }
+    if profile_error:
+        output["sector_analysis"].update({"status": "error",
+                                          "message": f"Employee Management lookup failed: {profile_error}"})
+    return output
 
+
+# ── Background job bookkeeping ───────────────────────────────────
+# Cache files (one per endpoint/organization/top_n) hold one of:
+#   {"status": "in_progress", ...}  — the analysis is running
+#   {"status": "failed", ...}       — the analysis failed; returned once, then removed so it can be retried
+#   <full result>                   — the analysis finished successfully
+# _RUNNING tracks jobs of this process, so an "in_progress" file left behind by a
+# restart (job no longer running) is detected and the analysis is started again.
+_RUNNING: set = set()
+_RUNNING_LOCK = threading.Lock()
+
+
+def _cache_path(endpoint: str, organization: str, top_n: int) -> str:
+    return os.path.join(FOLDER, _build_cache_key(endpoint.strip("/").replace("/", "_"), organization, str(top_n)))
+
+
+def _run_analysis_job(file_path: str, endpoint: str, organization: str, analyze: AnalysisFn) -> None:
+    log.info("=" * 70)
+    log.info(f"[JOB] {endpoint} — organization={organization} — started")
+    log.info("=" * 70)
+    try:
+        output = _compute_combined(endpoint, organization, analyze)
         if _has_error(output):
-            # Do not cache partial failures, so the next request retries
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            _save_cache(file_path, {"status": "failed",
+                                    "message": "Part of the analysis failed. Call the endpoint again to retry.",
+                                    "result": output})
         else:
             _save_cache(file_path, output)
+        log.info(f"[JOB] {endpoint} — organization={organization} — DONE")
+    except Exception as exc:
+        log.exception(f"[JOB] {endpoint} — organization={organization} — FAILED")
+        _save_cache(file_path, {"status": "failed",
+                                "message": f"Analysis failed: {exc}. Call the endpoint again to retry.",
+                                "result": None})
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING.discard(file_path)
 
-        log.info(f"[ENDPOINT] {endpoint} — DONE")
-        return output
 
-    except Exception:
+def _run_combined(endpoint: str, organization: str, top_n: int, analyze: AnalysisFn,
+                  background_tasks: BackgroundTasks, response: Response) -> Dict:
+    """Return the finished result, or start/report the background analysis."""
+    log.info(f"[ENDPOINT] {endpoint} — organization={organization}, top_n={top_n}")
+    _ensure_folder()
+    file_path = _cache_path(endpoint, organization, top_n)
+
+    with _RUNNING_LOCK:
+        if file_path in _RUNNING:
+            response.status_code = 202
+            return _in_progress_stub()
+
         if os.path.exists(file_path):
-            os.remove(file_path)
-        raise
+            with open(file_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            status = cached.get("status") if isinstance(cached, dict) else None
+            if status == "failed":
+                os.remove(file_path)          # report the failure once; the next call retries
+                return cached
+            if status != "in_progress":
+                log.info(f"Cache hit: {file_path}")
+                return cached
+            log.warning(f"Stale in-progress file (job not running): {file_path} — restarting analysis")
+
+        _RUNNING.add(file_path)
+        _save_cache(file_path, _in_progress_stub())
+
+    background_tasks.add_task(_run_analysis_job, file_path, endpoint, organization, analyze)
+    response.status_code = 202
+    return {"status": "started",
+            "message": "Analysis has started. Call the same endpoint again to get its status or results.",
+            "result": None}
 
 
 # ── 5.1  SHORT-TERM SKILLS ────────────────────────────────────────
 
 @app.get("/shorttermanalysis/skills")
 def short_term_skills(
+    background_tasks: BackgroundTasks,
+    response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_short_term_analysis(items, mode="skills", label_dict=labels, top_n=top_n,
                                        sector=sector, organization=org)
-    return _run_combined("/shorttermanalysis/skills", organization, top_n, analyze)
+    return _run_combined("/shorttermanalysis/skills", organization, top_n, analyze, background_tasks, response)
 
 
 # ── 5.2  SHORT-TERM OCCUPATIONS ───────────────────────────────────
 
 @app.get("/shorttermanalysis/occupations")
 def short_term_occupations(
+    background_tasks: BackgroundTasks,
+    response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_short_term_analysis(items, mode="occupations", label_dict=labels, top_n=top_n,
                                        sector=sector, organization=org)
-    return _run_combined("/shorttermanalysis/occupations", organization, top_n, analyze)
+    return _run_combined("/shorttermanalysis/occupations", organization, top_n, analyze, background_tasks, response)
 
 
 # ── 5.3  LONG-TERM SKILLS ─────────────────────────────────────────
 
 @app.get("/longtermanalysis/skills")
 def long_term_skills(
+    background_tasks: BackgroundTasks,
+    response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_long_term_skills_from_jobs(items, labels, top_n=top_n, sector=sector, data_scope=scope)
-    return _run_combined("/longtermanalysis/skills", organization, top_n, analyze)
+    return _run_combined("/longtermanalysis/skills", organization, top_n, analyze, background_tasks, response)
 
 
 # ── 5.4  LONG-TERM OCCUPATIONS ────────────────────────────────────
 
 @app.get("/longtermanalysis/occupations")
 def long_term_occupations(
+    background_tasks: BackgroundTasks,
+    response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_long_term_occupations_from_jobs(items, labels, top_n=top_n, sector=sector, data_scope=scope)
-    return _run_combined("/longtermanalysis/occupations", organization, top_n, analyze)
+    return _run_combined("/longtermanalysis/occupations", organization, top_n, analyze, background_tasks, response)
