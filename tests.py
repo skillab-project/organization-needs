@@ -948,6 +948,51 @@ class TestBackgroundJobs:
         assert a["metadata"]["organization"] == "Eclipse"
 
 
+class TestRerun:
+    """?rerun=true recomputes an existing analysis (same organization + top_n)."""
+
+    @pytest.mark.parametrize("path,key", ENDPOINTS)
+    def test_rerun_recomputes_finished_analysis(self, path, key, services):
+        portal, tracker, _ = services
+        first = _analyse(path, "Eclipse Foundation", 3)
+        n_portal, n_tracker = len(portal.calls), tracker.call_count
+        r = client.get(f"{path}?top_n=3&rerun=true", headers={ORG_HEADER: "Eclipse Foundation"})
+        assert r.status_code == 202 and r.json()["status"] == "started"
+        assert len(portal.calls) > n_portal and tracker.call_count > n_tracker   # really ran again
+        second = _get(path, "Eclipse Foundation").json()
+        assert second["organization_analysis"]["status"] == "ok"
+        assert second["metadata"]["analysis_date"] >= first["metadata"]["analysis_date"]
+
+    def test_rerun_while_running_does_not_start_twice(self, services):
+        path = "/shorttermanalysis/skills"
+        portal, tracker, _ = services
+        da._RUNNING.add(da._cache_path(path, "Eclipse", 3))
+        r = client.get(f"{path}?top_n=3&rerun=true", headers={ORG_HEADER: "Eclipse"})
+        assert r.status_code == 202 and r.json()["status"] == "in_progress"
+        assert portal.calls == [] and tracker.call_count == 0
+
+    def test_rerun_without_previous_result_just_starts(self, services):
+        path = "/longtermanalysis/skills"
+        r = client.get(f"{path}?top_n=3&rerun=true", headers={ORG_HEADER: "Eclipse"})
+        assert r.status_code == 202 and r.json()["status"] == "started"
+        assert _get(path, "Eclipse").json()["organization_analysis"]["status"] == "ok"
+
+    def test_rerun_only_affects_its_own_top_n(self, services):
+        path = "/shorttermanalysis/skills"
+        _analyse(path, "Eclipse", 3)
+        _analyse(path, "Eclipse", 2)
+        client.get(f"{path}?top_n=3&rerun=true", headers={ORG_HEADER: "Eclipse"})
+        assert _get(path, "Eclipse", 2).status_code == 200   # other top_n still cached
+
+    def test_rerun_false_uses_cache(self, services):
+        path = "/shorttermanalysis/skills"
+        portal, _, _ = services
+        first = _analyse(path, "Eclipse", 3)
+        n = len(portal.calls)
+        r = client.get(f"{path}?top_n=3&rerun=false", headers={ORG_HEADER: "Eclipse"})
+        assert r.status_code == 200 and r.json() == first and len(portal.calls) == n
+
+
 class TestEndpointEdgeCases:
     def test_org_without_sectors(self, services):
         _, tracker, _ = services

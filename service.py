@@ -14,6 +14,11 @@ Calling again with the same values returns 202 {"status": "in_progress"} while i
 and the full result (200) once it has finished. A failed analysis is reported once
 ({"status": "failed"}) and the next call starts it again.
 
+Rerun: add ?rerun=true to discard the stored result and compute the analysis again
+(same organization and top_n). It returns 202 {"status": "started"} like a first call;
+poll WITHOUT rerun afterwards. If that analysis is already running, rerun=true just
+reports {"status": "in_progress"} — it never starts a duplicate job.
+
 Every endpoint runs two analyses and returns both:
   organization_analysis — job ads of the organization from the Hiring Management API
   sector_analysis       — the organization's sectors are read from the Employee Management API,
@@ -1654,9 +1659,12 @@ def _run_analysis_job(file_path: str, endpoint: str, organization: str, analyze:
 
 
 def _run_combined(endpoint: str, organization: str, top_n: int, analyze: AnalysisFn,
-                  background_tasks: BackgroundTasks, response: Response) -> Dict:
-    """Return the finished result, or start/report the background analysis."""
-    log.info(f"[ENDPOINT] {endpoint} — organization={organization}, top_n={top_n}")
+                  background_tasks: BackgroundTasks, response: Response, rerun: bool = False) -> Dict:
+    """Return the finished result, or start/report the background analysis.
+
+    rerun=True ignores (and replaces) a stored result or failure and starts the
+    analysis again, unless it is already running."""
+    log.info(f"[ENDPOINT] {endpoint} — organization={organization}, top_n={top_n}, rerun={rerun}")
     _ensure_folder()
     file_path = _cache_path(endpoint, organization, top_n)
 
@@ -1665,7 +1673,9 @@ def _run_combined(endpoint: str, organization: str, top_n: int, analyze: Analysi
             response.status_code = 202
             return _in_progress_stub()
 
-        if os.path.exists(file_path):
+        if rerun and os.path.exists(file_path):
+            log.info(f"Rerun requested — discarding stored result: {file_path}")
+        elif os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
             status = cached.get("status") if isinstance(cached, dict) else None
@@ -1695,11 +1705,12 @@ def short_term_skills(
     response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
+    rerun: bool = Query(False, description="Discard the stored result and compute the analysis again."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_short_term_analysis(items, mode="skills", label_dict=labels, top_n=top_n,
                                        sector=sector, organization=org)
-    return _run_combined("/shorttermanalysis/skills", organization, top_n, analyze, background_tasks, response)
+    return _run_combined("/shorttermanalysis/skills", organization, top_n, analyze, background_tasks, response, rerun)
 
 
 # ── 5.2  SHORT-TERM OCCUPATIONS ───────────────────────────────────
@@ -1710,11 +1721,12 @@ def short_term_occupations(
     response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
+    rerun: bool = Query(False, description="Discard the stored result and compute the analysis again."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_short_term_analysis(items, mode="occupations", label_dict=labels, top_n=top_n,
                                        sector=sector, organization=org)
-    return _run_combined("/shorttermanalysis/occupations", organization, top_n, analyze, background_tasks, response)
+    return _run_combined("/shorttermanalysis/occupations", organization, top_n, analyze, background_tasks, response, rerun)
 
 
 # ── 5.3  LONG-TERM SKILLS ─────────────────────────────────────────
@@ -1725,10 +1737,11 @@ def long_term_skills(
     response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max skills per analysis."),
+    rerun: bool = Query(False, description="Discard the stored result and compute the analysis again."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_long_term_skills_from_jobs(items, labels, top_n=top_n, sector=sector, data_scope=scope)
-    return _run_combined("/longtermanalysis/skills", organization, top_n, analyze, background_tasks, response)
+    return _run_combined("/longtermanalysis/skills", organization, top_n, analyze, background_tasks, response, rerun)
 
 
 # ── 5.4  LONG-TERM OCCUPATIONS ────────────────────────────────────
@@ -1739,7 +1752,8 @@ def long_term_occupations(
     response: Response,
     organization: str = Header(..., alias="X-User-Organization", description="Organization name, e.g. 'eclipse'."),
     top_n: int = Query(50, ge=1, le=200, description="Max occupations per analysis."),
+    rerun: bool = Query(False, description="Discard the stored result and compute the analysis again."),
 ):
     def analyze(items, labels, sector, scope, org):
         return run_long_term_occupations_from_jobs(items, labels, top_n=top_n, sector=sector, data_scope=scope)
-    return _run_combined("/longtermanalysis/occupations", organization, top_n, analyze, background_tasks, response)
+    return _run_combined("/longtermanalysis/occupations", organization, top_n, analyze, background_tasks, response, rerun)
